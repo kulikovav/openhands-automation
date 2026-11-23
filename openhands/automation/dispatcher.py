@@ -23,11 +23,11 @@ import tarfile
 import uuid
 from collections.abc import Collection, Mapping
 from datetime import timedelta
-from typing import Any
+from typing import Any, Final
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -123,6 +123,9 @@ from openhands.automation.utils.timeout import resolve_automation_timeout_second
 from openhands.automation.utils.unhealthy import (
     maybe_disable_unhealthy_automation_after_run,
 )
+
+
+DISPATCH_RETRIES_KEY: Final[str] = "dispatch_retries"
 
 
 logger = logging.getLogger("automation.dispatcher")
@@ -953,8 +956,25 @@ async def _execute_run(
         error: str,
         disable: bool = False,
         status_detail: dict | None = None,
+        retryable: bool = False,
     ) -> None:
-        """Mark run as failed and optionally disable the automation."""
+        """Mark run as failed and optionally disable the automation.
+
+        A transient failure marked retryable, with retries left, returns the
+        run to PENDING instead, so the next poll dispatches it again.
+        """
+        if (
+            retryable
+            and not disable
+            and (status_detail or {}).get("transient", False)
+            and await _requeue_transient_failure(session_factory, run, status_detail)
+        ):
+            logger.warning(
+                "Requeued run after a transient dispatch failure: %s",
+                error,
+                extra=_log_ctx(),
+            )
+            return
         await mark_run_terminal(
             session_factory,
             run,
@@ -1242,6 +1262,7 @@ async def _execute_run(
         source = "agent_server" if backend.is_local_mode else "sandbox_api"
         await _fail(
             "Failed to get execution context",
+            retryable=True,
             status_detail=run_status_detail_from_exception(
                 exc,
                 phase=RunStatusPhase.DISPATCH,
@@ -1699,6 +1720,9 @@ async def _execute_run(
         "Execution failed: %s", result.error, extra=_log_ctx(sandbox_id=ctx.sandbox_id)
     )
     await backend.release_context(client, ctx)
+    # The start call may have reached the agent server before it failed, so
+    # this failure is not retryable: a second dispatch could run the
+    # entrypoint twice in one workspace.
     await _fail(
         error,
         status_detail=make_run_status_detail(
@@ -1846,6 +1870,11 @@ async def _execute_run_safe(
             await _execute_run(run, settings, session_factory, client)
     except Exception as exc:
         logger.exception("Background execution failed", extra=extra)
+        if await _requeue_transient_failure(session_factory, run, None):
+            logger.warning(
+                "Requeued run after an unexpected dispatch failure", extra=extra
+            )
+            return
         await mark_run_terminal(
             session_factory,
             run,
@@ -1870,6 +1899,81 @@ async def _execute_run_safe(
                 "failure_kind": "dispatch_error",
             },
         )
+
+
+async def _requeue_transient_failure(
+    session_factory: async_sessionmaker[AsyncSession],
+    run: AutomationRun,
+    status_detail: dict | None,
+) -> bool:
+    """Return a run to PENDING for a later dispatch attempt.
+
+    Returns False when the retries are used up or the run already owns started
+    work, so the caller fails the run; True when the run is no longer RUNNING,
+    which leaves the owner of the new state alone. A run whose bash command or
+    sandbox was recorded is never requeued, because a second dispatch would
+    duplicate work the first attempt already started. The run waits as a
+    PENDING row, which the watchdog skips; the next dispatch sets a fresh
+    provisioning deadline. The retry counter lives in ``run_metadata``, so no
+    schema change is needed.
+
+    The count-then-update pairs assume one dispatcher process, which is what
+    the SQLite deployment this patch targets runs.
+    """
+    max_retries = get_config().service.dispatcher_max_dispatch_retries
+    try:
+        async with session_factory() as session:
+            db_run = (
+                (
+                    await session.execute(
+                        select(AutomationRun).where(AutomationRun.id == run.id)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if db_run is None or db_run.status != AutomationRunStatus.RUNNING:
+                return True
+            if db_run.bash_command_id or db_run.sandbox_id:
+                return False
+            metadata = dict(db_run.run_metadata or {})
+            retries = int(metadata.get(DISPATCH_RETRIES_KEY, 0))
+            if retries >= max_retries:
+                return False
+            metadata[DISPATCH_RETRIES_KEY] = retries + 1
+            result = await session.execute(
+                update(AutomationRun)
+                .where(
+                    AutomationRun.id == run.id,
+                    AutomationRun.status == AutomationRunStatus.RUNNING,
+                )
+                .values(
+                    status=AutomationRunStatus.PENDING,
+                    started_at=None,
+                    timeout_at=None,
+                    completed_at=None,
+                    error_detail=None,
+                    status_detail=status_detail,
+                    run_metadata=metadata,
+                )
+            )
+            if result.rowcount == 0:
+                # A terminal transition won the race between the read and the
+                # update, so the requeue must not resurrect the run.
+                await session.rollback()
+                return True
+            await session.commit()
+            run.status = AutomationRunStatus.PENDING
+            logger.info(
+                "Requeued run %s (retry %d of %d)",
+                run.id,
+                retries + 1,
+                max_retries,
+            )
+            return True
+    except Exception:
+        logger.exception("Failed to requeue run %s", run.id)
+        return False
 
 
 async def dispatcher_loop(
