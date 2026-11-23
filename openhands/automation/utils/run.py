@@ -18,6 +18,7 @@ from openhands.automation.models import (
     AutomationRunStatus,
     AutomationState,
 )
+from openhands.automation.targets import target_name_of
 from openhands.automation.telemetry import capture_automation_event
 from openhands.automation.utils.change_events import (
     SYSTEM_ACTOR,
@@ -233,6 +234,12 @@ async def create_pending_run(
             telemetry_distinct_id or automation.telemetry_distinct_id
         ),
         observability_parent_span_context=observability_parent_span_context,
+        # Target snapshot: the run keeps it after the automation's target
+        # changes, so it reconciles against what it was created for.
+        target_id=automation.target_id,
+        target_name=(
+            target_name_of(automation.target_id) if automation.target_id else None
+        ),
     )
     session.add(run)
 
