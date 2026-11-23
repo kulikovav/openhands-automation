@@ -6,10 +6,11 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from openhands.automation.backends.governed import (
+    GOVERNED_START_GRACE_SECONDS,
     ExecutionClaim,
     cancel_governed_conversation,
     claim_execution,
@@ -329,6 +330,49 @@ class TestReconcileByState:
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail["code"] == "runtime_missing"
+
+    async def test_missing_record_during_start_grace_stays_running(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(async_session_factory)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.records[claim.conversation_id] = (404, {})
+
+        async with server.client() as client:
+            marked = await reconcile_governed_runs(async_session_factory, client=client)
+
+        assert marked == 0
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.RUNNING
+        assert ("DELETE", f"/api/conversations/{claim.conversation_id}") not in (
+            server.requests
+        )
+
+    async def test_missing_record_after_start_grace_fails(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(async_session_factory)
+        stale_claim = dict(run.execution_claim or {})
+        stale_claim["claimed_at"] = (
+            utcnow() - timedelta(seconds=GOVERNED_START_GRACE_SECONDS + 1)
+        ).isoformat()
+        async with async_session_factory() as session:
+            await session.execute(
+                update(AutomationRun)
+                .where(AutomationRun.id == run.id)
+                .values(execution_claim=stale_claim)
+            )
+            await session.commit()
+
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.records[claim.conversation_id] = (404, {})
+
+        async with server.client() as client:
+            await reconcile_governed_runs(async_session_factory, client=client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "conversation_error"
 
     async def test_keep_alive_keeps_the_record(
         self, async_session_factory, targets_env

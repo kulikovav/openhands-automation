@@ -22,6 +22,7 @@ import logging
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
@@ -39,7 +40,7 @@ from openhands.automation.utils.agent_server import (
     VerificationOutcome,
     VerificationResult,
 )
-from openhands.automation.utils.time import utcnow
+from openhands.automation.utils.time import ensure_utc, utcnow
 
 
 if TYPE_CHECKING:
@@ -57,6 +58,12 @@ GOVERNED_RUN_NAMESPACE: Final[uuid.UUID] = uuid.UUID(
 CLAIM_KEYS: Final[frozenset[str]] = frozenset(
     {"target_id", "target_url", "conversation_id", "claimed_at"}
 )
+
+# A governed start provisions a sandbox before the conversation record exists.
+# A start whose response was lost (or that outlived the client timeout) is
+# still in flight, so a 404 on the claimed conversation is not proof of failure
+# during this window. The run timeout remains the outer bound.
+GOVERNED_START_GRACE_SECONDS: Final[int] = 300
 
 _RUNTIME_MISSING_STATUSES: Final[frozenset[str]] = frozenset(
     {"missing", "ownership_lost", "error"}
@@ -256,6 +263,24 @@ class GovernedConversationBackend(ExecutionBackend):
     def _headers(self) -> dict[str, str]:
         return {"X-Session-API-Key": self._require_target().api_key}
 
+    def _start_pending_within_grace(self) -> bool:
+        """Whether a start is still in flight and its record may not exist yet.
+
+        Only an unconfirmed start (the run's ``conversation_id`` is unset) has
+        this window. Once the start is confirmed, a missing record is terminal.
+        """
+        if self._run.conversation_id is not None:
+            return False
+        claim = ExecutionClaim.from_dict(self._run.execution_claim)
+        if claim is None:
+            return False
+        try:
+            claimed_at = ensure_utc(datetime.fromisoformat(claim.claimed_at))
+        except ValueError:
+            return False
+        age = (utcnow() - claimed_at).total_seconds()
+        return age < GOVERNED_START_GRACE_SECONDS
+
     @property
     def is_local_mode(self) -> bool:
         return False
@@ -395,6 +420,15 @@ class GovernedConversationBackend(ExecutionBackend):
                 detail="Conversation is archived or its runtime is gone (HTTP 410)",
             )
         if response.status_code == 404:
+            if self._start_pending_within_grace():
+                return ConversationState(
+                    kind="running",
+                    transient=True,
+                    detail=(
+                        "Conversation is not visible yet; the start may still "
+                        "be provisioning its sandbox"
+                    ),
+                )
             return ConversationState(
                 kind="failed",
                 code="conversation_error",
