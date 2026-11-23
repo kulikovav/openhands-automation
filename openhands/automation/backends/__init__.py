@@ -27,6 +27,7 @@ from openhands.automation.backends.base import (
     StartedConversation,
 )
 from openhands.automation.backends.cloud import CloudSandboxBackend
+from openhands.automation.backends.governed import GovernedConversationBackend
 from openhands.automation.backends.local import LocalAgentServerBackend
 
 
@@ -41,13 +42,16 @@ def get_backend(run: AutomationRun) -> ExecutionBackend:
         run: The automation run this backend will operate on.
 
     Returns:
-        ExecutionBackend: Either CloudSandboxBackend or LocalAgentServerBackend
+        ExecutionBackend: GovernedConversationBackend for a run with a
+        target, else CloudSandboxBackend or LocalAgentServerBackend.
     """
     from openhands.automation.config import get_config
 
     config = get_config()
     settings = config.service
 
+    if run.target_id is not None:
+        return GovernedConversationBackend(run)
     if settings.is_local_mode:
         return LocalAgentServerBackend(
             agent_server_url=settings.agent_server_url,
@@ -68,6 +72,7 @@ __all__ = [
     "ConversationStart",
     "ExecutionBackend",
     "ExecutionContext",
+    "GovernedConversationBackend",
     "StartedConversation",
     "CloudSandboxBackend",
     "LocalAgentServerBackend",

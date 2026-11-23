@@ -10,6 +10,12 @@ Scheduled and event-driven automation execution for OpenHands Cloud. This servic
 - **Event-Driven**: Trigger automations via webhooks (e.g., GitHub events)
 - **API Key Management**: Per-user API keys for secure automation access
 - **Run History**: Track automation runs with status and results
+- **Governed Targets**: Dispatch prompt-preset automations as one Agent Server
+  conversation on a configured execution target (`AUTOMATION_TARGETS`), instead
+  of the bash entrypoint. Each entry allows exactly the keys `id`, `name`,
+  `url`, `api_key`, `origin` (defaults to the URL origin), `capability`,
+  `policy_id` and `agent_profile_id`; unknown keys fail startup. Unset or
+  empty means no targets and legacy behavior.
 
 For a direct callback example, see [Teams outgoing webhooks](docs/teams-webhooks.md),
 including source admission, API setup and acknowledgement behavior.
@@ -19,6 +25,22 @@ including source admission, API setup and acknowledgement behavior.
 The Automation Service owns automation definitions, cron scheduling, webhooks, run history, dispatch, and sandbox lifecycle orchestration. It manages when work runs; the Agent Server and [`OpenHands/software-agent-sdk`](https://github.com/OpenHands/software-agent-sdk) execute the agent conversations and own agent/tool behavior, workspaces, events, and API endpoints.
 
 [`OpenHands/typescript-client`](https://github.com/OpenHands/typescript-client) provides typed browser access to the Agent Server API, while [`OpenHands/OpenHands`](https://github.com/OpenHands/OpenHands) owns Agent Canvas UI and frontend integration. If a change belongs in one of those repositories, open the PR there rather than duplicating the logic here.
+
+## Fork releases (bleenk)
+
+This repository is the kulikovav fork of `OpenHands/automation`. The fork
+follows the same scheme as the other OpenHands forks:
+
+- The `main` branch mirrors upstream only and never takes fork commits.
+- The `dev` branch carries the bleenk patches on top of the upstream release
+  tag it is based on (currently `1.34.1`).
+- A release is an annotated tag on `dev`, named `<upstream>-bleenk.<n>`, for
+  example `1.34.1-bleenk.0`. Push `dev` and the tag to `origin`.
+
+Consumers install from the fork at the tag instead of patching site-packages.
+The folded bleenk patches are the dispatcher dispatch-retry behavior and the
+presets' SIGTERM interrupt handler; their image self-checks live as tests in
+`tests/test_dispatch_retry_selfcheck.py` and `tests/test_sigterm_selfcheck.py`.
 
 ## Development
 
