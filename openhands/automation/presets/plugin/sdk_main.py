@@ -87,6 +87,7 @@ import inspect
 import json
 import os
 import random
+import signal
 import sys
 import threading
 import time
@@ -909,6 +910,33 @@ More activity arrived on the same subject while this run was queued:
 
     report_phase("Agent is working on the task")
     threading.Thread(target=_phase_poster, name="phase-poster", daemon=True).start()
+
+    # The bash service enforces the automation timeout: it sends SIGTERM to
+    # this process group, waits one second, then escalates to SIGKILL. The
+    # conversation runs in the agent-server process, so without this handler it
+    # outlives the run and keeps spending tokens. Interrupt it inside the
+    # SIGTERM grace window. os._exit keeps the watchdog's timeout detail
+    # authoritative: no completion callback may race its terminal UPDATE.
+    def _interrupt_on_sigterm(_signum, _frame) -> None:
+        def _interrupt() -> None:
+            try:
+                conversation.interrupt()
+                print(
+                    "  SIGTERM: interrupted the running conversation",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"  SIGTERM: conversation.interrupt() failed: {e}",
+                    file=sys.stderr,
+                )
+
+        thread = threading.Thread(target=_interrupt, daemon=True)
+        thread.start()
+        thread.join(timeout=0.8)
+        os._exit(143)
+
+    signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
 
     cost = None
 
