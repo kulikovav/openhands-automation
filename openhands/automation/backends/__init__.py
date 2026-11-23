@@ -50,7 +50,7 @@ def get_backend(run: AutomationRun) -> ExecutionBackend:
     config = get_config()
     settings = config.service
 
-    if run.target_id is not None:
+    if isinstance(run.target_id, str) and run.target_id:
         return GovernedConversationBackend(run)
     if settings.is_local_mode:
         return LocalAgentServerBackend(
