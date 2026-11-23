@@ -316,6 +316,9 @@ async def test_execute_run_safe_emits_categorized_failure_telemetry(
 
     monkeypatch.setenv("AUTOMATION_POSTHOG_API_KEY", "ph_test")
     monkeypatch.delenv("AUTOMATION_AGENT_SERVER_URL", raising=False)
+    # The dispatch-retry patch requeues an unexpected dispatch failure first;
+    # retries off exercises the terminal path this test asserts at once.
+    monkeypatch.setenv("AUTOMATION_DISPATCHER_MAX_DISPATCH_RETRIES", "0")
     clear_config_cache()
     fake_client = _FakeTelemetryClient()
     monkeypatch.setattr(telemetry, "_telemetry_http_client", fake_client)
@@ -3113,9 +3116,15 @@ class TestDeferredRunRequeueFailure:
             )
 
     async def test_failed_requeue_marks_run_failed(
-        self, async_session_factory, mock_settings, mock_client
+        self, async_session_factory, mock_settings, mock_client, monkeypatch
     ):
         """A requeue write failure fails the run instead of stranding it."""
+        from openhands.automation.config import clear_config_cache
+
+        # The dispatch-retry patch requeues an unexpected dispatch failure
+        # first; retries off exercises the terminal path at once.
+        monkeypatch.setenv("AUTOMATION_DISPATCHER_MAX_DISPATCH_RETRIES", "0")
+        clear_config_cache()
         run, run_id = await self._make_running_run(async_session_factory)
         backend = MagicMock()
         backend.is_local_mode = False
