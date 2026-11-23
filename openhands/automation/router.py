@@ -2240,12 +2240,22 @@ async def cancel_run(
         properties={"trigger_source": "manual"},
     )
 
+    from openhands.automation.config import get_settings
+
     # Clean up sandbox for runs that were RUNNING. Cancelling is explicit, so
     # unlike `complete_run` the sandbox goes even when the run owns a subject
     # -- but the subject is released with it, or the next event would pick this
     # run and pay a lookup for a sandbox we just deleted. The key stays on the
     # row as the record of what this run was about.
-    if run.sandbox_id:
+    if run.execution_claim:
+        # A governed run cancels as interrupt + delete of its conversation,
+        # never by stopping a bash command.
+        from openhands.automation.backends.governed import (
+            cancel_governed_conversation,
+        )
+
+        await cancel_governed_conversation(get_http_client(request), run)
+    elif run.sandbox_id:
         if run.subject_key and run.subject_released_at is None:
             run.subject_released_at = utcnow()
             await session.commit()

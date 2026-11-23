@@ -39,6 +39,10 @@ from openhands.automation.backends import (
     StartedConversation,
     get_backend,
 )
+from openhands.automation.backends.governed import (
+    claim_execution,
+    record_started_conversation,
+)
 from openhands.automation.config import ServiceSettings, get_config
 from openhands.automation.conversations import COALESCED_TURNS_KEY
 from openhands.automation.db import using_sqlite
@@ -75,6 +79,10 @@ from openhands.automation.plugin_specs import (
 )
 from openhands.automation.preset_router import with_current_preset_runner
 from openhands.automation.subjects import conversation_id_for, service_account_id_of
+from openhands.automation.targets import (
+    CODE_TARGET_UNAVAILABLE,
+    resolve_target,
+)
 from openhands.automation.telemetry import (
     capture_automation_event,
     get_automation_backend_distinct_id,
@@ -1038,6 +1046,21 @@ async def _execute_run(
     # drives both the bash command timeout and the watchdog cleanup deadline.
     effective_timeout = resolve_automation_timeout_seconds(automation.timeout)
 
+    # A governed run is exactly one conversation on its target: no tarball, no
+    # entrypoint, no host bash, and never a fallback to the default backend.
+    if run.target_id is not None:
+        await _execute_governed_run(
+            run,
+            automation,
+            backend,
+            session_factory,
+            client,
+            effective_timeout,
+            _fail,
+            _log_ctx,
+        )
+        return
+
     # 2. Preflight plugin automations before creating a sandbox. The agent server
     # performs the real fetch after it is ready, but this catches bad sources,
     # refs, manifests, and required plugins without consuming sandbox capacity.
@@ -1771,6 +1794,105 @@ async def _execute_run(
     )
 
 
+async def _execute_governed_run(
+    run: AutomationRun,
+    automation: Automation,
+    backend: ExecutionBackend,
+    session_factory: async_sessionmaker[AsyncSession],
+    client: httpx.AsyncClient,
+    effective_timeout: int,
+    fail: Any,
+    log_ctx: Any,
+) -> None:
+    """Dispatch a governed run as one conversation on its execution target.
+
+    The execution claim is committed before the start call, so a crash or
+    restart reuses the same conversation id and the target's idempotent create
+    dedupes a repeat start. A run with a claim is never requeued. The
+    watchdog's ``reconcile_governed_runs`` owns everything after the start.
+    """
+    target = resolve_target(run.target_id)
+    if target is None:
+        error = f"Execution target {run.target_id!r} is no longer configured"
+        await fail(
+            error,
+            status_detail=make_run_status_detail(
+                phase=RunStatusPhase.DISPATCH,
+                kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+                detail=error,
+                transient=False,
+                source="automation_service",
+                operation="resolve_target",
+                code=CODE_TARGET_UNAVAILABLE,
+            ),
+        )
+        return
+
+    claim = await claim_execution(session_factory, run, target)
+    if claim is None:
+        logger.info(
+            "Run left RUNNING before its claim; nothing to start", extra=log_ctx()
+        )
+        return
+    if run.conversation_id == claim.conversation_id:
+        # A confirmed start already happened; a duplicate dispatch must not
+        # resend the task.
+        logger.info(
+            "Governed conversation %s already started",
+            claim.conversation_id,
+            extra=log_ctx(),
+        )
+        return
+
+    outcome = await backend.start_conversation(client, automation, run, claim)
+    if outcome.confirmed:
+        # The response named the exact claimed UUID: only now is it recorded.
+        await record_started_conversation(session_factory, run, claim.conversation_id)
+        await update_run_timeout_at(
+            session_factory,
+            run.id,
+            utcnow()
+            + timedelta(
+                seconds=effective_timeout + get_config().sandbox.run_timeout_margin
+            ),
+        )
+        logger.info(
+            "Governed conversation %s started on target %s",
+            claim.conversation_id,
+            target.id,
+            extra=log_ctx(),
+        )
+        return
+    if outcome.ambiguous:
+        # The start may have reached the target. The claim stands and the
+        # watchdog reconciles by identity; nothing starts a second
+        # conversation.
+        logger.warning(
+            "Ambiguous governed start acknowledgement (%s); leaving claim %s",
+            outcome.error,
+            claim.conversation_id,
+            extra=log_ctx(),
+        )
+        return
+    await fail(
+        outcome.error or "Failed to start the governed conversation",
+        status_detail=make_run_status_detail(
+            phase=RunStatusPhase.DISPATCH,
+            kind=(
+                RunStatusDetailKind.AUTH
+                if outcome.code == "policy_denied"
+                else RunStatusDetailKind.EXECUTION_ERROR
+            ),
+            detail=outcome.error or "Failed to start the governed conversation",
+            transient=False,
+            source="agent_server",
+            operation="start_conversation",
+            code=outcome.code or "conversation_error",
+            status_code=outcome.status_code,
+        ),
+    )
+
+
 async def dispatch_pending_runs(
     session_factory: async_sessionmaker[AsyncSession],
     settings: ServiceSettings,
@@ -1969,6 +2091,10 @@ async def _requeue_transient_failure(
             )
             if db_run is None or db_run.status != AutomationRunStatus.RUNNING:
                 return True
+            if db_run.execution_claim:
+                # A governed run with a claim owns started work by identity:
+                # a requeue would dispatch it again. Never requeue it.
+                return False
             if db_run.bash_command_id or db_run.sandbox_id:
                 return False
             metadata = dict(db_run.run_metadata or {})

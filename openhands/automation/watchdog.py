@@ -29,12 +29,18 @@ from pathlib import Path
 from typing import Final
 from uuid import UUID
 
+import httpx
 from sqlalchemy import delete, inspect, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from openhands.automation.backends import ExecutionBackend, get_backend
+from openhands.automation.backends.governed import (
+    ExecutionClaim,
+    GovernedConversationBackend,
+    release_conversation,
+)
 from openhands.automation.backends.local import local_runs_root
 from openhands.automation.config import Settings, get_config
 from openhands.automation.models import (
@@ -47,7 +53,7 @@ from openhands.automation.telemetry import capture_automation_event
 from openhands.automation.utils import log_extra
 from openhands.automation.utils.agent_server import VerificationOutcome
 from openhands.automation.utils.change_events import SYSTEM_ACTOR, set_audit_actor
-from openhands.automation.utils.run import record_first_run_outcome
+from openhands.automation.utils.run import mark_run_terminal, record_first_run_outcome
 from openhands.automation.utils.run_status_detail import (
     RunStatusDetailKind,
     RunStatusPhase,
@@ -570,6 +576,190 @@ async def _verify_and_mark_run(
     return result.rowcount > 0
 
 
+async def reconcile_governed_runs(
+    session_factory: async_sessionmaker[AsyncSession],
+    client: httpx.AsyncClient | None = None,
+    limit: int = 50,
+) -> int:
+    """Reconcile RUNNING governed runs by their conversation state.
+
+    ponytail: the conversation record is polled once per watchdog interval
+    (default 60s), so a governed run completes up to one interval after its
+    conversation does. The polling is control-plane-side on purpose: the
+    governed sandbox must not need egress to this service. Upgrade path: a
+    run-bound callback credential posting to /v1/runs/{id}/complete.
+    """
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=get_config().http.http_timeout)
+    marked = 0
+    try:
+        async with session_factory() as session:
+            runs = list(
+                (
+                    await session.execute(
+                        select(AutomationRun)
+                        .where(
+                            AutomationRun.status == AutomationRunStatus.RUNNING,
+                            AutomationRun.execution_claim.isnot(None),
+                        )
+                        .order_by(AutomationRun.created_at.asc())
+                        .limit(limit)
+                        .options(selectinload(AutomationRun.automation))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        for run in runs:
+            if await _reconcile_governed_run(session_factory, run, client):
+                marked += 1
+    finally:
+        if owns_client:
+            await client.aclose()
+    return marked
+
+
+async def _reconcile_governed_run(
+    session_factory: async_sessionmaker[AsyncSession],
+    run: AutomationRun,
+    client: httpx.AsyncClient,
+) -> bool:
+    """Reconcile one claimed governed run. Returns True when it went terminal."""
+    extra = log_extra(run_id=str(run.id))
+    claim = ExecutionClaim.from_dict(run.execution_claim)
+    if claim is None:
+        return False
+    backend = get_backend(run)
+    keep_alive: bool | None = None
+    async with session_factory() as session:
+        keep_alive = await _get_automation_keep_alive(session, run)
+
+    if not isinstance(backend, GovernedConversationBackend) or backend.target is None:
+        await mark_run_terminal(
+            session_factory,
+            run,
+            AutomationRunStatus.FAILED,
+            f"Execution target {run.target_id!r} is no longer configured",
+            status_detail=make_run_status_detail(
+                phase=RunStatusPhase.VERIFICATION,
+                kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+                detail=f"Execution target {run.target_id!r} is not configured",
+                transient=False,
+                source="automation_service",
+                operation="reconcile_governed_run",
+                code="target_unavailable",
+            ),
+        )
+        run.status = AutomationRunStatus.FAILED
+        await capture_automation_event(
+            "automation_run_failed",
+            automation=_loaded_automation(run),
+            run=run,
+            session_factory=session_factory,
+            properties={
+                "trigger_source": "watchdog",
+                "failure_kind": "target_unavailable",
+            },
+        )
+        return True
+
+    # Timeout path: interrupt the conversation, then release it — the
+    # governed mapping of stopping the run's bash command.
+    now = utcnow()
+    if run.timeout_at is not None and ensure_utc(run.timeout_at) <= now:
+        try:
+            await backend.interrupt(client, claim.conversation_id)
+        except Exception as e:
+            logger.warning("Interrupt at timeout failed: %s", e, extra=extra)
+        await release_conversation(client, backend, claim, keep_alive=keep_alive)
+        error_msg = "no terminal conversation state received"
+        await mark_run_terminal(
+            session_factory,
+            run,
+            AutomationRunStatus.FAILED,
+            f"Timed out: {error_msg}",
+            status_detail=make_run_status_detail(
+                phase=RunStatusPhase.VERIFICATION,
+                kind=RunStatusDetailKind.TIMEOUT,
+                detail=error_msg,
+                transient=False,
+                source="automation_service",
+                operation="reconcile_governed_run",
+                previous=run.status_detail,
+            ),
+        )
+        run.status = AutomationRunStatus.FAILED
+        run.error_detail = f"Timed out: {error_msg}"
+        await capture_automation_event(
+            "automation_run_failed",
+            automation=_loaded_automation(run),
+            run=run,
+            session_factory=session_factory,
+            properties={"trigger_source": "watchdog", "failure_kind": "timeout"},
+        )
+        return True
+
+    state = await backend.fetch_conversation_state(client, claim.conversation_id)
+    if state.kind == "running":
+        return False
+
+    if state.kind == "completed":
+        await mark_run_terminal(session_factory, run, AutomationRunStatus.COMPLETED)
+        run.status = AutomationRunStatus.COMPLETED
+        await release_conversation(client, backend, claim, keep_alive=keep_alive)
+        await capture_automation_event(
+            "automation_run_completed",
+            automation=_loaded_automation(run),
+            run=run,
+            session_factory=session_factory,
+            properties={"trigger_source": "watchdog"},
+        )
+        logger.info("Governed run completed (conversation finished)", extra=extra)
+        return True
+
+    kind_by_code = {
+        "runtime_missing": RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+        "policy_denied": RunStatusDetailKind.AUTH,
+        "target_unavailable": RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+    }
+    await mark_run_terminal(
+        session_factory,
+        run,
+        AutomationRunStatus.FAILED,
+        state.detail or "Governed conversation failed",
+        status_detail=make_run_status_detail(
+            phase=RunStatusPhase.VERIFICATION,
+            kind=kind_by_code.get(
+                state.code or "", RunStatusDetailKind.EXECUTION_ERROR
+            ),
+            detail=state.detail or "Governed conversation failed",
+            transient=False,
+            source="agent_server",
+            operation="reconcile_governed_run",
+            code=state.code,
+            previous=run.status_detail,
+        ),
+    )
+    run.status = AutomationRunStatus.FAILED
+    run.error_detail = state.detail
+    await release_conversation(client, backend, claim, keep_alive=keep_alive)
+    await capture_automation_event(
+        "automation_run_failed",
+        automation=_loaded_automation(run),
+        run=run,
+        session_factory=session_factory,
+        properties={
+            "trigger_source": "watchdog",
+            "failure_kind": str(state.code or "conversation_error"),
+        },
+    )
+    logger.warning(
+        "Governed run failed (%s): %s", state.code, state.detail, extra=extra
+    )
+    return True
+
+
 async def mark_stale_runs(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -597,6 +787,9 @@ async def mark_stale_runs(
             select(AutomationRun.id).where(
                 AutomationRun.status == AutomationRunStatus.RUNNING,
                 AutomationRun.timeout_at.isnot(None),
+                # Governed runs are reconciled by conversation state in
+                # reconcile_governed_runs, not by bash verification here.
+                AutomationRun.execution_claim.is_(None),
                 AutomationRun.timeout_at < now,
             )
         )
@@ -1005,6 +1198,13 @@ async def watchdog_loop(
         if shutdown_event is not None and shutdown_event.is_set():
             logger.info("Watchdog received shutdown signal, exiting")
             break
+
+        try:
+            reconciled = await reconcile_governed_runs(session_factory)
+            if reconciled:
+                logger.info("Reconciled %d governed run(s)", reconciled)
+        except Exception:
+            logger.exception("Error reconciling governed runs")
 
         try:
             marked = await mark_stale_runs(session_factory, settings)
