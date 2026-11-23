@@ -607,6 +607,16 @@ class CreateAutomationRequest(BaseModel):
         description="Agent profile selected for this automation.",
     )
 
+    target_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Execution target (AUTOMATION_TARGETS id) this automation runs on. "
+            "Null selects the deployment default. Only prompt-preset automations "
+            "may name a target."
+        ),
+    )
+
     name: str = Field(..., min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=2000)
     model: str | None = Field(
@@ -812,6 +822,16 @@ class UpdateAutomationRequest(BaseModel):
     )
     visibility: AutomationVisibility | None = Field(
         default=None, description=VISIBILITY_DESCRIPTION
+    )
+
+    target_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Execution target (AUTOMATION_TARGETS id). Null removes it and "
+            "returns runs to the deployment default; omit to leave it unchanged. "
+            "Changing it is refused while any run is PENDING or RUNNING."
+        ),
     )
 
     name: str | None = Field(default=None, min_length=1, max_length=500)
@@ -1358,6 +1378,10 @@ class AutomationResponse(BaseModel):
     org_id: uuid.UUID
     model: str | None
 
+    target_id: str | None = None
+    # The target's configured name. Null target means the deployment default.
+    target_name: str | None = None
+
     name: str
     description: str | None = None
     prompt: str | None
@@ -1610,6 +1634,10 @@ class AutomationRunResponse(BaseModel):
     # Set only while a run blocked by a transient limit waits to be retried.
     deferred_until: UtcDatetime | None = None
     conversation_id: str | None
+    # The target snapshot taken at run creation. Null target means the
+    # deployment default.
+    target_id: str | None = None
+    target_name: str | None = None
     cost: float | None = None
     timeout_at: UtcDatetime | None
     sandbox_id: str | None
@@ -1715,6 +1743,14 @@ class TriggerCapabilities(_SetupContractModel):
     event: EventCapabilities | None = None
 
 
+class TargetCapability(_SetupContractModel):
+    """One configured execution target, with no secret and no URL."""
+
+    id: str = Field(..., description="AUTOMATION_TARGETS entry id")
+    name: str = Field(..., description="Display name of the target")
+    origin: str = Field(..., description="Origin of the target's Agent Server")
+
+
 class CapabilitiesResponse(_SetupContractModel):
     """What this deployment supports, discovered before a setup form renders."""
 
@@ -1744,6 +1780,13 @@ class CapabilitiesResponse(_SetupContractModel):
     )
     triggers: TriggerCapabilities
     features: list[str]
+    targets: list[TargetCapability] = Field(
+        default_factory=list,
+        description=(
+            "Execution targets this deployment offers (AUTOMATION_TARGETS). "
+            "Id, name and origin only: no secrets and no URLs beyond the origin."
+        ),
+    )
     repo_providers: list[str] = Field(
         default_factory=list,
         description=(

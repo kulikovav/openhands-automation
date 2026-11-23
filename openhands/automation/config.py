@@ -610,6 +610,11 @@ class ServiceSettings(BaseSettings):
             longest possible run, or the token expires mid-run.
         AUTOMATION_WEBHOOK_SECRET: Webhook signature secret (optional)
         AUTOMATION_OPENHANDS_API_BASE_URL: OpenHands API URL (default: https://app.all-hands.dev)
+        AUTOMATION_TARGETS: JSON array of execution targets (governed Agent
+            Servers). Each entry allows exactly: id, name, url, api_key, origin
+            (defaults to the URL origin), capability, policy_id,
+            agent_profile_id. Unknown keys fail startup. Unset or empty means
+            no targets and legacy behavior.
 
         # Product telemetry (optional)
         AUTOMATION_POSTHOG_API_KEY: PostHog project key. Empty disables capture.
@@ -675,6 +680,14 @@ class ServiceSettings(BaseSettings):
 
     # OpenHands SaaS API
     openhands_api_base_url: str = "https://app.all-hands.dev"
+
+    # Execution targets (AUTOMATION_TARGETS): a JSON array of governed Agent
+    # Servers an automation can run on. Each entry allows exactly the keys id,
+    # name, url, api_key, origin (defaults to the URL origin), capability,
+    # policy_id and agent_profile_id. Unset or empty means no targets and
+    # legacy behavior. Parsed and validated by openhands.automation.targets,
+    # which never logs or returns api_key.
+    targets: str = ""
 
     # Background workers
     scheduler_interval_seconds: int = 60
@@ -792,6 +805,14 @@ class ServiceSettings(BaseSettings):
         """Match migration env fallback for standard Postgres SSL variables."""
         if "db_ssl_mode" not in self.model_fields_set:
             self.db_ssl_mode = os.getenv("DB_SSL_MODE", os.getenv("PGSSLMODE", ""))
+        return self
+
+    @model_validator(mode="after")
+    def validate_targets_config(self) -> "ServiceSettings":
+        """Reject a malformed AUTOMATION_TARGETS at startup, with a clear error."""
+        from openhands.automation.targets import parse_targets
+
+        parse_targets(self.targets)
         return self
 
     @property

@@ -102,6 +102,9 @@ from openhands.automation.schemas import (
 )
 from openhands.automation.storage import FileStore, get_file_store
 from openhands.automation.tags import normalize_tag
+from openhands.automation.targets import (
+    validate_target_selection,
+)
 from openhands.automation.telemetry import (
     automation_created_event,
     automation_created_properties,
@@ -270,6 +273,13 @@ async def create_automation(
     ``run_as_user_id`` creates it as a service account of the org (managers only).
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
+    # A governed target refuses script and custom-tarball automations; only
+    # the prompt preset (the preset endpoints) may name a target.
+    validate_target_selection(
+        body.target_id,
+        preset_metadata=None,
+        plugin_spec=None,
+    )
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
         session, user.org_id, body.factory_id, body.outcome_parsers
@@ -340,6 +350,7 @@ async def create_automation(
         entrypoint=body.entrypoint,
         timeout=default_automation_timeout(body.timeout),
         keep_alive=body.keep_alive,
+        target_id=body.target_id,
         enabled=automation_state_enabled(state),
         state=state,
         telemetry_distinct_id=get_request_telemetry_context(
@@ -964,6 +975,35 @@ async def update_automation(
                 parser_factory_id,
                 update_data.get("outcome_parsers", auto.outcome_parsers),
             )
+    # Target selection is validated on every update of a targeted automation
+    # and on every explicit target change: the target must still exist and the
+    # automation must be the prompt preset, exactly as at creation.
+    if "target_id" in update_data and update_data["target_id"] != auto.target_id:
+        live_run = await session.scalar(
+            select(AutomationRun.id)
+            .where(
+                AutomationRun.automation_id == auto.id,
+                AutomationRun.status.in_(
+                    (AutomationRunStatus.PENDING, AutomationRunStatus.RUNNING)
+                ),
+            )
+            .limit(1)
+        )
+        if live_run is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "target_id cannot change while any run of this automation "
+                    "is PENDING or RUNNING"
+                ),
+            )
+    resulting_target_id = update_data.get("target_id", auto.target_id)
+    if resulting_target_id or "target_id" in update_data:
+        validate_target_selection(
+            resulting_target_id,
+            preset_metadata=auto.preset_metadata,
+            plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+        )
     # Same ownership check as create. Only a new value is checked: resending the
     # stored path cannot grant anything the row does not already have, and that
     # upload need not be owned by the editor or still be live.
@@ -1664,6 +1704,37 @@ async def dispatch_automation(
     auto = await _get_org_automation(session, automation_id, user)
     await _assert_can_manage(auto, user)
     await _assert_normal_api_can_use_draft_artifact(session, auto)
+
+    # A run on a removed target can never dispatch; refuse here rather than
+    # letting the run fail in the background.
+    validate_target_selection(
+        auto.target_id,
+        preset_metadata=auto.preset_metadata,
+        plugin_spec=auto.plugin_spec,
+    )
+    # One in-flight manual run per automation and target, refused the same way
+    # every other live-run conflict is (409).
+    if auto.target_id is not None:
+        live_run = await session.scalar(
+            select(AutomationRun.id)
+            .where(
+                AutomationRun.automation_id == auto.id,
+                AutomationRun.target_id == auto.target_id,
+                AutomationRun.trigger_source == "manual",
+                AutomationRun.status.in_(
+                    (AutomationRunStatus.PENDING, AutomationRunStatus.RUNNING)
+                ),
+            )
+            .limit(1)
+        )
+        if live_run is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "A manual run for this automation and target is already "
+                    "PENDING or RUNNING"
+                ),
+            )
 
     telemetry_context = get_request_telemetry_context(request)
     with span(

@@ -171,6 +171,11 @@ class Automation(Base):
     # Profile IDs belong to the configured Agent Server, not to this database.
     agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
 
+    # Execution target this automation runs on (AUTOMATION_TARGETS id). NULL
+    # selects the deployment default backend. Only prompt-preset automations
+    # may name a target. Resolved at dispatch; runs snapshot it at creation.
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # Executable plugin-backed automation spec. When set, the dispatcher fetches
     # the plugin source at run time and packages it as the run tarball.
     plugin_spec: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -284,6 +289,13 @@ class Automation(Base):
         back_populates="automation",
         cascade="all, delete-orphan",
     )
+
+    @property
+    def target_name(self) -> str | None:
+        """The configured display name of ``target_id`` (never a secret)."""
+        from openhands.automation.targets import target_name_of
+
+        return target_name_of(self.target_id)
 
 
 class AutomationOutcomeValue(Base):
@@ -406,6 +418,18 @@ class AutomationRun(Base):
 
     # Conversation created by the SDK script (set by completion callback)
     conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Target snapshot taken at run creation: the automation's target id and
+    # its configured name then. Kept unchanged when the automation's target
+    # later changes, so a run keeps reconciling against what it started on.
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # The governed-run execution claim, written with one conditional UPDATE
+    # before the conversation start: {target_id, target_url, conversation_id,
+    # claimed_at}. A run with a claim is never requeued and never mints a new
+    # conversation id; a restart reuses the claim.
+    execution_claim: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Accumulated LLM cost in USD (set by completion callback).
     # NULL means "unknown" — e.g. runs that predate cost tracking, or that were

@@ -38,10 +38,12 @@ from openhands.automation.schemas import (
     DraftValidationError,
     EventCapabilities,
     EventTrigger,
+    TargetCapability,
     TriggerCapabilities,
     ValidateDraftRequest,
     ValidateDraftResponse,
 )
+from openhands.automation.targets import get_targets
 from openhands.automation.trigger_matcher import matches_trigger
 from openhands.automation.utils.cron import min_interval_seconds
 from openhands.automation.utils.event_sources import (
@@ -141,6 +143,9 @@ async def get_capabilities(
         features.append("webhookDelivery")
     if config.kv.enabled:
         features.extend(["kvStore", "outcomes"])
+    targets = list(get_targets().values())
+    if targets:
+        features.append("governedTargets")
 
     return CapabilitiesResponse(
         ready=True,
@@ -171,6 +176,9 @@ async def get_capabilities(
             ),
         ),
         features=sorted(features),
+        targets=[
+            TargetCapability(id=t.id, name=t.name, origin=t.origin) for t in targets
+        ],
         # The SDK packaged into a run decides which providers' tokens it can
         # clone with, so a setup form can offer exactly those repositories.
         repo_providers=sorted(provider.value for provider in GitProvider),
