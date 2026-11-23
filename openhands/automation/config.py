@@ -559,6 +559,8 @@ class ServiceSettings(BaseSettings):
         AUTOMATION_SCHEDULER_BATCH_SIZE: Scheduler batch size (default: 50)
         AUTOMATION_DISPATCHER_INTERVAL_SECONDS: Dispatcher poll interval (default: 10)
         AUTOMATION_DISPATCHER_BATCH_SIZE: Dispatcher batch size (default: 10)
+        AUTOMATION_DISPATCHER_MAX_DISPATCH_RETRIES: Retries of a transient
+            dispatch failure before the run fails (default: 3)
         AUTOMATION_WATCHDOG_INTERVAL_SECONDS: Watchdog poll interval (default: 60)
         AUTOMATION_MAX_CONCURRENT_RUNS: Cap on concurrently RUNNING runs across
             the service (default: 0 = unlimited). At the cap, further PENDING
@@ -679,6 +681,10 @@ class ServiceSettings(BaseSettings):
     scheduler_batch_size: int = 50
     dispatcher_interval_seconds: int = 10
     dispatcher_batch_size: int = 10
+    # Retries of a transient dispatch failure (a transport error, a 429, or
+    # a 5xx before the entrypoint starts). The run returns to PENDING and
+    # the next poll retries it. 0 disables the retry.
+    dispatcher_max_dispatch_retries: int = 3
     watchdog_interval_seconds: int = 60
 
     # Maximum number of automation runs allowed to be RUNNING at once across the
