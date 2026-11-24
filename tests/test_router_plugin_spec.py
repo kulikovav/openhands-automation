@@ -209,6 +209,7 @@ async def test_create_plugin_spec_uses_manifest_suggested_trigger(
         "timezone": "UTC",
     }
     assert data["keep_alive"] is None
+    assert data["retain_transcript"] is True
 
 
 @pytest.mark.asyncio

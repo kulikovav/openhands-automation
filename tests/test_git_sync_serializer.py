@@ -68,6 +68,7 @@ def _make_automation(**overrides) -> Automation:
         entrypoint="python main.py",
         timeout=300,
         keep_alive=None,
+        retain_transcript=True,
         enabled=True,
         prompt=None,
         preset_metadata=None,
@@ -160,6 +161,7 @@ class TestSerializeAutomation:
             "scm.pull_request.number": "pull_request.number",
         }
         assert fields["tarball_source"] == {"type": "internal", "url": None}
+        assert fields["retain_transcript"] is True
 
     def test_null_description_is_omitted(self):
         automation = _make_automation(description=None)

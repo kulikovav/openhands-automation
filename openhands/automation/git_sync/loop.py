@@ -556,6 +556,13 @@ async def _validate_and_resolve_fields(
 
     # A ValueError skips the directory, like every other invalid field.
     keep_alive = continue_conversation_keep_alive(trigger, fields.get("keep_alive"))
+    retain_transcript = fields.get("retain_transcript", True)
+    if retain_transcript is None:
+        # An export predating the field omits it; an explicit null is not a
+        # decision either, so both mean the default.
+        retain_transcript = True
+    if not isinstance(retain_transcript, bool):
+        raise ValueError("automation.yaml 'retain_transcript' must be a boolean")
     observability_associations = validate_observability_associations(
         fields.get("observability_associations")
     )
@@ -674,6 +681,7 @@ async def _validate_and_resolve_fields(
         "setup_script_path": setup_script_path,
         "timeout": timeout,
         "keep_alive": keep_alive,
+        "retain_transcript": retain_transcript,
         "enabled": enabled,
         "state": state,
         "prompt": fields.get("prompt"),

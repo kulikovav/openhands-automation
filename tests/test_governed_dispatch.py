@@ -3,6 +3,7 @@
 import json
 import uuid
 from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from openhands.automation.backends.governed import (
     GOVERNED_START_GRACE_SECONDS,
     ExecutionClaim,
+    GovernedConversationBackend,
     cancel_governed_conversation,
     claim_execution,
     governed_conversation_id_for,
@@ -72,6 +74,10 @@ class FakeGovernedServer:
         self.claim_at_post: list[dict | None] = []
         self.created: list[str] = []
         self.conversations: set[str] = set()
+        self.deleted: list[str] = []
+        self.released: list[str] = []
+        self.release_status = 204
+        self.delete_status = 200
         self.records: dict[str, tuple[int, dict]] = {}
         self.create_acks: list[int | str] = []
         self.fail_create_with_read_timeout = False
@@ -130,9 +136,17 @@ class FakeGovernedServer:
         if method == "POST" and path.endswith("/interrupt"):
             return httpx.Response(200, json={})
 
+        if method == "DELETE" and path.endswith("/runtime"):
+            conversation_id = path.split("/")[-2]
+            self.released.append(conversation_id)
+            return httpx.Response(self.release_status)
+
         if method == "DELETE" and path.startswith("/api/conversations/"):
-            self.conversations.discard(path.rsplit("/", 1)[-1])
-            return httpx.Response(204)
+            conversation_id = path.rsplit("/", 1)[-1]
+            self.deleted.append(conversation_id)
+            if self.delete_status < 400:
+                self.conversations.discard(conversation_id)
+            return httpx.Response(self.delete_status)
 
         return httpx.Response(404, json={"detail": "unexpected"})
 
@@ -142,6 +156,7 @@ async def make_run(
     *,
     target_id: str | None = TARGET_ID,
     keep_alive: bool | None = None,
+    retain_transcript: bool = True,
     timeout_at=None,
 ):
     async with session_factory() as session:
@@ -158,6 +173,7 @@ async def make_run(
             entrypoint="python main.py",
             target_id=target_id,
             keep_alive=keep_alive,
+            retain_transcript=retain_transcript,
         )
         run = AutomationRun(
             id=uuid.uuid4(),
@@ -284,6 +300,7 @@ class TestReconcileByState:
     async def test_finished_maps_to_completed(self, async_session_factory, targets_env):
         run, claim = await self._claimed_run(async_session_factory)
         server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
         server.records[claim.conversation_id] = (
             200,
             {"id": claim.conversation_id, "execution_status": "finished"},
@@ -295,10 +312,83 @@ class TestReconcileByState:
         assert marked == 1
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.COMPLETED
-        # Released at terminal: the runtime is deleted.
-        assert ("DELETE", f"/api/conversations/{claim.conversation_id}") in (
+        # A terminal run stops its runtime and keeps the conversation.
+        assert ("DELETE", f"/api/conversations/{claim.conversation_id}/runtime") in (
             server.requests
         )
+        assert ("DELETE", f"/api/conversations/{claim.conversation_id}") not in (
+            server.requests
+        )
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "transcript_retained"
+        assert claim.conversation_id in server.conversations
+
+    async def test_finished_with_retain_off_deletes_the_conversation(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(
+            async_session_factory, retain_transcript=False
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
+        server.records[claim.conversation_id] = (
+            200,
+            {"id": claim.conversation_id, "execution_status": "finished"},
+        )
+
+        async with server.client() as client:
+            await reconcile_governed_runs(async_session_factory, client=client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.COMPLETED
+        assert server.released == []
+        assert server.deleted == [claim.conversation_id]
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "transcript_unavailable"
+        assert claim.conversation_id not in server.conversations
+
+    async def test_failed_release_does_not_claim_retention(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(async_session_factory)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
+        server.release_status = 500
+        server.records[claim.conversation_id] = (
+            200,
+            {"id": claim.conversation_id, "execution_status": "finished"},
+        )
+
+        async with server.client() as client:
+            await reconcile_governed_runs(async_session_factory, client=client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.COMPLETED
+        # A release that failed established no outcome, so it claims none.
+        assert stored.status_detail is None
+        assert claim.conversation_id in server.conversations
+
+    async def test_failed_delete_does_not_claim_an_unavailable_transcript(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(
+            async_session_factory, retain_transcript=False
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
+        server.delete_status = 500
+        server.records[claim.conversation_id] = (
+            200,
+            {"id": claim.conversation_id, "execution_status": "finished"},
+        )
+
+        async with server.client() as client:
+            await reconcile_governed_runs(async_session_factory, client=client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.COMPLETED
+        assert stored.status_detail is None
+        assert claim.conversation_id in server.conversations
 
     async def test_error_maps_to_failed_with_detail(
         self, async_session_factory, targets_env
@@ -316,6 +406,11 @@ class TestReconcileByState:
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail["code"] == "conversation_error"
+        # The failure code survives: retention only labels completed runs.
+        assert (
+            "DELETE",
+            f"/api/conversations/{claim.conversation_id}/runtime",
+        ) in server.requests
 
     async def test_410_maps_to_runtime_missing(
         self, async_session_factory, targets_env
@@ -374,10 +469,12 @@ class TestReconcileByState:
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail["code"] == "conversation_error"
 
-    async def test_keep_alive_keeps_the_record(
+    async def test_retain_transcript_true_keeps_the_record(
         self, async_session_factory, targets_env
     ):
-        run, claim = await self._claimed_run(async_session_factory, keep_alive=True)
+        run, claim = await self._claimed_run(
+            async_session_factory, retain_transcript=True
+        )
         server = FakeGovernedServer(async_session_factory, run.id)
         server.conversations.add(claim.conversation_id)
         server.records[claim.conversation_id] = (
@@ -390,12 +487,13 @@ class TestReconcileByState:
 
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.COMPLETED
-        assert ("DELETE", f"/api/conversations/{claim.conversation_id}") not in (
-            server.requests
-        )
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "transcript_retained"
+        assert server.released == [claim.conversation_id]
+        assert server.deleted == []
         assert claim.conversation_id in server.conversations
 
-    async def test_timeout_interrupts_and_deletes(
+    async def test_timeout_interrupts_and_releases_the_runtime(
         self, async_session_factory, targets_env
     ):
         run, claim = await self._claimed_run(
@@ -411,10 +509,38 @@ class TestReconcileByState:
         assert marked == 1
         paths = [p for _, p in server.requests]
         assert f"/api/conversations/{claim.conversation_id}/interrupt" in paths
-        assert f"/api/conversations/{claim.conversation_id}" in paths
+        assert f"/api/conversations/{claim.conversation_id}/runtime" in paths
+        assert f"/api/conversations/{claim.conversation_id}" not in paths
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.error_detail.startswith("Timed out:")
+        # Retention never replaces the timeout's own status code.
+        assert stored.status_detail is not None
+        assert stored.status_detail["kind"] == "timeout"
+        assert "code" not in stored.status_detail
+
+    async def test_timeout_with_retain_off_deletes_the_conversation(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(
+            async_session_factory,
+            retain_transcript=False,
+            timeout_at=utcnow() - timedelta(minutes=1),
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
+
+        async with server.client() as client:
+            await reconcile_governed_runs(async_session_factory, client=client)
+
+        assert server.released == []
+        assert server.deleted == [claim.conversation_id]
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail is not None
+        assert stored.status_detail["kind"] == "timeout"
+        assert "code" not in stored.status_detail
+        assert claim.conversation_id not in server.conversations
 
     async def test_watchdog_reconciles_and_never_requeues(
         self, async_session_factory, targets_env
@@ -457,3 +583,24 @@ class TestReconcileByState:
             f"/api/conversations/{claim.conversation_id}",
         ]
         assert claim.conversation_id not in server.conversations
+
+
+class TestCleanupAfterVerification:
+    async def test_cleanup_uses_the_automation_retention_setting(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(async_session_factory, retain_transcript=False)
+        target = resolve_target(TARGET_ID)
+        assert target is not None
+        assert await claim_execution(async_session_factory, run, target) is not None
+        backend = GovernedConversationBackend(run)
+
+        with patch(
+            "openhands.automation.backends.governed.release_conversation",
+            new=AsyncMock(),
+        ) as release:
+            await backend.cleanup_after_verification(str(run.id))
+
+        release.assert_awaited_once()
+        assert release.await_args is not None
+        assert release.await_args.kwargs["retain_transcript"] is False

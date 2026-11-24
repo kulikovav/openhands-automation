@@ -88,6 +88,43 @@ async def test_cancel_running_run(async_client, async_session):
     assert data["status"] == "CANCELLED"
 
 
+async def test_cancel_governed_run_marks_the_transcript_unavailable(
+    async_client, async_session
+):
+    """Cancellation deletes a governed conversation even when runs retain it."""
+    automation = Automation(
+        user_id=TEST_USER_ID,
+        org_id=TEST_ORG_ID,
+        name="Governed Automation",
+        trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+        tarball_path="https://example.com/code.tar.gz",
+        entrypoint="python main.py",
+    )
+    async_session.add(automation)
+    await async_session.flush()
+
+    run = AutomationRun(
+        id=uuid.uuid4(),
+        automation_id=automation.id,
+        status=AutomationRunStatus.RUNNING,
+        started_at=utcnow(),
+        execution_claim={
+            "target_id": "gone",
+            "target_url": "https://gone.invalid",
+            "conversation_id": str(uuid.uuid4()),
+            "claimed_at": utcnow().isoformat(),
+        },
+    )
+    async_session.add(run)
+    await async_session.flush()
+
+    resp = await async_client.post(f"/api/automation/v1/runs/{run.id}/cancel")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "CANCELLED"
+    assert data["status_detail"]["code"] == "transcript_unavailable"
+
+
 async def test_cancel_completed_run_returns_409(async_client, async_session):
     """Cancelling a COMPLETED run should return 409."""
     _, run = await _create_automation_with_run(

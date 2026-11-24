@@ -146,6 +146,7 @@ def _automation_yaml_fields(
         "entrypoint": automation.entrypoint,
         "timeout": automation.timeout,
         "keep_alive": automation.keep_alive,
+        "retain_transcript": automation.retain_transcript,
         "enabled": automation.enabled,
         "state": getattr(automation.state, "value", automation.state),
         "prompt": automation.prompt,

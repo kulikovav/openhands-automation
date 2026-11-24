@@ -2343,6 +2343,7 @@ class TestTarballUploadLifecycle:
                     "outcome_parsers: null",
                     "preset_metadata: null",
                     "prompt: null",
+                    "retain_transcript: true",
                     "setup_script_path: null",
                     "state: ACTIVE",
                 ]
@@ -2358,6 +2359,7 @@ class TestTarballUploadLifecycle:
                     "outcome_parsers: null",
                     "preset_metadata: null",
                     "prompt: null",
+                    "retain_transcript: true",
                     "setup_script_path: null",
                     "state: INACTIVE",
                 ]
@@ -2796,6 +2798,28 @@ class TestImportedAutomationDefaults:
             automation = (await session.execute(select(Automation))).scalars().one()
         assert automation.enabled is False
         assert automation.state.value == "INACTIVE"
+
+    async def test_new_folder_without_retain_transcript_imports_retention(
+        self, sqlite_session_factory, git_settings, service_settings, origin
+    ):
+        await self._push_hand_written(origin)
+
+        await self._cycle(sqlite_session_factory, git_settings, service_settings)
+
+        async with sqlite_session_factory() as session:
+            automation = (await session.execute(select(Automation))).scalars().one()
+        assert automation.retain_transcript is True
+
+    async def test_new_folder_with_retain_transcript_false_imports_the_opt_out(
+        self, sqlite_session_factory, git_settings, service_settings, origin
+    ):
+        await self._push_hand_written(origin, self._YAML + "retain_transcript: false\n")
+
+        await self._cycle(sqlite_session_factory, git_settings, service_settings)
+
+        async with sqlite_session_factory() as session:
+            automation = (await session.execute(select(Automation))).scalars().one()
+        assert automation.retain_transcript is False
 
     async def test_new_folder_with_enabled_true_still_imports_active(
         self, sqlite_session_factory, git_settings, service_settings, origin
