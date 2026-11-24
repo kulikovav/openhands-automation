@@ -3,7 +3,6 @@
 import json
 import uuid
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -12,11 +11,13 @@ from sqlalchemy.orm import selectinload
 
 from openhands.automation.backends.governed import (
     GOVERNED_START_GRACE_SECONDS,
+    ConversationGoneError,
     ExecutionClaim,
-    GovernedConversationBackend,
+    TranscriptOutcome,
     cancel_governed_conversation,
     claim_execution,
     governed_conversation_id_for,
+    release_conversation,
 )
 from openhands.automation.config import ServiceSettings, clear_config_cache
 from openhands.automation.dispatcher import _execute_run, _requeue_transient_failure
@@ -33,12 +34,13 @@ from openhands.automation.watchdog import reconcile_governed_runs
 TEST_USER_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
 TEST_ORG_ID = uuid.UUID("87654321-4321-8765-4321-876543218765")
 TARGET_ID = "governed-1"
+TARGET_URL = "https://governed.example:8443"
 TARGET_SECRET = "sk-target-secret-do-not-leak"
 PROFILE_ID = "0a1b2c3d-0000-4000-8000-000000000042"
 TARGET_ENTRY = {
     "id": TARGET_ID,
     "name": "Governed Sandbox",
-    "url": "https://governed.example:8443",
+    "url": TARGET_URL,
     "api_key": TARGET_SECRET,
     "agent_profile_id": PROFILE_ID,
 }
@@ -155,7 +157,6 @@ async def make_run(
     session_factory,
     *,
     target_id: str | None = TARGET_ID,
-    keep_alive: bool | None = None,
     retain_transcript: bool = True,
     timeout_at=None,
 ):
@@ -172,7 +173,6 @@ async def make_run(
             tarball_path="https://example.com/automation.tar.gz",
             entrypoint="python main.py",
             target_id=target_id,
-            keep_alive=keep_alive,
             retain_transcript=retain_transcript,
         )
         run = AutomationRun(
@@ -347,7 +347,7 @@ class TestReconcileByState:
         assert stored.status_detail["code"] == "transcript_unavailable"
         assert claim.conversation_id not in server.conversations
 
-    async def test_failed_release_does_not_claim_retention(
+    async def test_failed_release_records_the_outcome_and_schedules_retry(
         self, async_session_factory, targets_env
     ):
         run, claim = await self._claimed_run(async_session_factory)
@@ -364,8 +364,11 @@ class TestReconcileByState:
 
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.COMPLETED
-        # A release that failed established no outcome, so it claims none.
-        assert stored.status_detail is None
+        # A release that failed is recorded, not dropped.
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "release_failed"
+        # The janitor retries: nothing else stops a governed sandbox.
+        assert stored.sandbox_cleanup_due_at is not None
         assert claim.conversation_id in server.conversations
 
     async def test_failed_delete_does_not_claim_an_unavailable_transcript(
@@ -387,7 +390,8 @@ class TestReconcileByState:
 
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status == AutomationRunStatus.COMPLETED
-        assert stored.status_detail is None
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "release_failed"
         assert claim.conversation_id in server.conversations
 
     async def test_error_maps_to_failed_with_detail(
@@ -567,7 +571,7 @@ class TestReconcileByState:
         stored = await reload_run(async_session_factory, run.id)
         assert stored.status != AutomationRunStatus.PENDING
 
-    async def test_cancel_interrupts_then_deletes(
+    async def test_cancel_interrupts_and_releases_a_retained_transcript(
         self, async_session_factory, targets_env
     ):
         run, claim = await self._claimed_run(async_session_factory)
@@ -575,8 +579,33 @@ class TestReconcileByState:
         server.conversations.add(claim.conversation_id)
 
         async with server.client() as client:
-            await cancel_governed_conversation(client, run)
+            outcome = await cancel_governed_conversation(
+                client, run, retain_transcript=True
+            )
 
+        assert outcome is TranscriptOutcome.RETAINED
+        paths = [p for _, p in server.requests]
+        assert paths == [
+            f"/api/conversations/{claim.conversation_id}/interrupt",
+            f"/api/conversations/{claim.conversation_id}/runtime",
+        ]
+        assert claim.conversation_id in server.conversations
+
+    async def test_cancel_with_retain_off_deletes_the_conversation(
+        self, async_session_factory, targets_env
+    ):
+        run, claim = await self._claimed_run(
+            async_session_factory, retain_transcript=False
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.conversations.add(claim.conversation_id)
+
+        async with server.client() as client:
+            outcome = await cancel_governed_conversation(
+                client, run, retain_transcript=False
+            )
+
+        assert outcome is TranscriptOutcome.UNAVAILABLE
         paths = [p for _, p in server.requests]
         assert paths == [
             f"/api/conversations/{claim.conversation_id}/interrupt",
@@ -585,22 +614,74 @@ class TestReconcileByState:
         assert claim.conversation_id not in server.conversations
 
 
-class TestCleanupAfterVerification:
-    async def test_cleanup_uses_the_automation_retention_setting(
-        self, async_session_factory, targets_env
-    ):
-        run = await make_run(async_session_factory, retain_transcript=False)
-        target = resolve_target(TARGET_ID)
-        assert target is not None
-        assert await claim_execution(async_session_factory, run, target) is not None
-        backend = GovernedConversationBackend(run)
+class _FakeReleaseBackend:
+    """A governed backend whose runtime release answers a scripted result."""
 
-        with patch(
-            "openhands.automation.backends.governed.release_conversation",
-            new=AsyncMock(),
-        ) as release:
-            await backend.cleanup_after_verification(str(run.id))
+    def __init__(self, results: list[bool]):
+        self.results = results
+        self.calls = 0
 
-        release.assert_awaited_once()
-        assert release.await_args is not None
-        assert release.await_args.kwargs["retain_transcript"] is False
+    async def release_runtime(self, client, conversation_id: str) -> bool:  # noqa: ARG002
+        self.calls += 1
+        return self.results.pop(0)
+
+
+class TestReleaseConversation:
+    async def test_failed_release_is_retried(self):
+        backend = _FakeReleaseBackend([False, True])
+        claim = ExecutionClaim(
+            target_id=TARGET_ID,
+            target_url=TARGET_URL,
+            conversation_id=str(uuid.uuid4()),
+            claimed_at=utcnow().isoformat(),
+        )
+
+        async with httpx.AsyncClient() as client:
+            outcome = await release_conversation(
+                client, backend, claim, retain_transcript=True
+            )
+
+        assert outcome is TranscriptOutcome.RETAINED
+        assert backend.calls == 2
+
+    async def test_release_fails_after_three_attempts(self):
+        backend = _FakeReleaseBackend([False, False, False])
+        claim = ExecutionClaim(
+            target_id=TARGET_ID,
+            target_url=TARGET_URL,
+            conversation_id=str(uuid.uuid4()),
+            claimed_at=utcnow().isoformat(),
+        )
+
+        async with httpx.AsyncClient() as client:
+            outcome = await release_conversation(
+                client, backend, claim, retain_transcript=True
+            )
+
+        assert outcome is TranscriptOutcome.RELEASE_FAILED
+        assert backend.calls == 3
+
+    async def test_gone_conversation_is_not_retried(self):
+        class GoneBackend:
+            def __init__(self):
+                self.calls = 0
+
+            async def release_runtime(self, client, conversation_id: str) -> bool:  # noqa: ARG002
+                self.calls += 1
+                raise ConversationGoneError(conversation_id)
+
+        backend = GoneBackend()
+        claim = ExecutionClaim(
+            target_id=TARGET_ID,
+            target_url=TARGET_URL,
+            conversation_id=str(uuid.uuid4()),
+            claimed_at=utcnow().isoformat(),
+        )
+
+        async with httpx.AsyncClient() as client:
+            outcome = await release_conversation(
+                client, backend, claim, retain_transcript=True
+            )
+
+        assert outcome is TranscriptOutcome.UNAVAILABLE
+        assert backend.calls == 1

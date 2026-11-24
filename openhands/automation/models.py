@@ -202,7 +202,8 @@ class Automation(Base):
     # Governed runs only: stop the sandbox at terminal state but keep the
     # conversation and its events for the deployment retention window. False
     # deletes the conversation immediately. Independent of keep_alive, which
-    # is the cloud sandbox cleanup flag.
+    # is the cloud sandbox cleanup flag: the governed backend never reads
+    # keep_alive and always stops the runtime at terminal state.
     retain_transcript: Mapped[bool] = mapped_column(
         default=True, nullable=False, server_default=text("true")
     )
