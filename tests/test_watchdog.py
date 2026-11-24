@@ -12,6 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from openhands.automation.backends.governed import (
+    TranscriptOutcome,
+    transcript_status_detail,
+)
 from openhands.automation.config import Settings, clear_config_cache
 from openhands.automation.models import (
     Automation,
@@ -949,6 +953,94 @@ class TestDeferredSandboxCleanup:
         async with async_session_factory() as session:
             run = await session.get(AutomationRun, run_id)
             assert run.sandbox_cleanup_due_at is None
+
+    async def _governed_due_run(
+        self, async_session_factory, automation_with_run
+    ) -> uuid.UUID:
+        """Turn the fixture run into a terminal governed run due for retry."""
+        run_id = automation_with_run["run_id"]
+        async with async_session_factory() as session:
+            run = await session.get(AutomationRun, run_id)
+            run.status = AutomationRunStatus.COMPLETED
+            run.sandbox_id = None
+            run.execution_claim = {
+                "target_id": "governed-1",
+                "target_url": "https://governed.example:8443",
+                "conversation_id": str(uuid.uuid4()),
+                "claimed_at": utcnow().isoformat(),
+            }
+            run.status_detail = transcript_status_detail(
+                TranscriptOutcome.RELEASE_FAILED
+            )
+            run.sandbox_cleanup_due_at = utcnow() - timedelta(seconds=1)
+            await session.commit()
+        return run_id
+
+    @pytest.mark.asyncio
+    async def test_sweep_retries_a_governed_release(
+        self, async_session_factory, automation_with_run
+    ):
+        """A successful governed retry clears the stamp and keeps the failure detail."""
+        run_id = await self._governed_due_run(
+            async_session_factory, automation_with_run
+        )
+        mock_backend = MagicMock()
+        mock_backend.cleanup_after_verification = AsyncMock(return_value=None)
+
+        with patch(
+            "openhands.automation.watchdog.get_backend", return_value=mock_backend
+        ):
+            assert await cleanup_due_sandboxes(async_session_factory) == 1
+
+        mock_backend.cleanup_after_verification.assert_awaited_once_with(str(run_id))
+        async with async_session_factory() as session:
+            run = await session.get(AutomationRun, run_id)
+            assert run.sandbox_cleanup_due_at is None
+            assert run.status_detail["code"] == "release_failed"
+
+    @pytest.mark.asyncio
+    async def test_sweep_keeps_a_failed_governed_release_due(
+        self, async_session_factory, automation_with_run
+    ):
+        """A failed governed retry keeps the stamp and the release_failed detail."""
+        run_id = await self._governed_due_run(
+            async_session_factory, automation_with_run
+        )
+        mock_backend = MagicMock()
+        mock_backend.cleanup_after_verification = AsyncMock(return_value=False)
+
+        with patch(
+            "openhands.automation.watchdog.get_backend", return_value=mock_backend
+        ):
+            assert await cleanup_due_sandboxes(async_session_factory) == 0
+
+        async with async_session_factory() as session:
+            run = await session.get(AutomationRun, run_id)
+            assert run.sandbox_cleanup_due_at is not None
+            assert run.status_detail["code"] == "release_failed"
+
+    @pytest.mark.asyncio
+    async def test_sweep_keeps_a_governed_release_due_when_cleanup_raises(
+        self, async_session_factory, automation_with_run
+    ):
+        """An unexpected governed cleanup error keeps the stamp for retry."""
+        run_id = await self._governed_due_run(
+            async_session_factory, automation_with_run
+        )
+        mock_backend = MagicMock()
+        mock_backend.cleanup_after_verification = AsyncMock(
+            side_effect=RuntimeError("target unavailable")
+        )
+
+        with patch(
+            "openhands.automation.watchdog.get_backend", return_value=mock_backend
+        ):
+            assert await cleanup_due_sandboxes(async_session_factory) == 0
+
+        async with async_session_factory() as session:
+            run = await session.get(AutomationRun, run_id)
+            assert run.sandbox_cleanup_due_at is not None
+            assert run.status_detail["code"] == "release_failed"
 
 
 class TestSubjectOwningRunsKeepTheirSandbox:
