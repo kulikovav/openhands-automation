@@ -162,7 +162,7 @@ class ExecutionBackend(ABC):
         """
 
     @abstractmethod
-    async def cleanup_after_verification(self, run_id: str) -> None:
+    async def cleanup_after_verification(self, run_id: str) -> bool | None:
         """Clean up resources after verification fails.
 
         For Cloud mode: Deletes the sandbox when called by policy-aware callers.
@@ -170,6 +170,10 @@ class ExecutionBackend(ABC):
 
         Args:
             run_id: Run ID string for logging
+
+        Returns:
+            False when the caller must keep the deferred cleanup due and retry.
+            None or True means cleanup is done.
         """
 
     async def stop_command(self, command_id: str) -> None:  # noqa: ARG002

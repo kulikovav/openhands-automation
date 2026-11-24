@@ -33,7 +33,10 @@ from openhands.automation.auth import (
     require_permission,
 )
 from openhands.automation.backends import get_backend
-from openhands.automation.backends.governed import TRANSCRIPT_UNAVAILABLE
+from openhands.automation.backends.governed import (
+    TranscriptOutcome,
+    transcript_status_detail,
+)
 from openhands.automation.config import get_config
 from openhands.automation.db import get_session
 from openhands.automation.factory_router import (
@@ -144,9 +147,6 @@ from openhands.automation.utils.run_as import (
     verify_service_account,
 )
 from openhands.automation.utils.run_status_detail import (
-    RunStatusDetailKind,
-    RunStatusPhase,
-    make_run_status_detail,
     run_status_detail_from_callback_error,
 )
 from openhands.automation.utils.sandbox import cleanup_sandbox, pause_sandbox
@@ -2184,7 +2184,8 @@ async def cancel_run(
     For PENDING runs, prevents future dispatch.
     For RUNNING runs, marks as cancelled and stops the run's work: Cloud runs
     lose their sandbox; local runs share one persistent agent server, so only
-    the run's entrypoint command is stopped.
+    the run's entrypoint command is stopped. Governed runs interrupt their
+    conversation and release its runtime; a retained transcript survives.
     Returns 409 if the run is already in a terminal state.
     """
     result = await session.execute(
@@ -2212,22 +2213,7 @@ async def cancel_run(
         )
 
     now = utcnow()
-    # A governed run's cancellation deletes its conversation, so its
-    # transcript is explicitly unavailable even when terminal runs retain it.
     governed_cancel = bool(run.execution_claim)
-    cancel_status_detail = (
-        make_run_status_detail(
-            phase=RunStatusPhase.CLEANUP,
-            kind=RunStatusDetailKind.CLEANUP,
-            detail="Governed conversation deleted on cancellation",
-            transient=False,
-            source="automation_service",
-            operation="cancel_run",
-            code=TRANSCRIPT_UNAVAILABLE,
-        )
-        if governed_cancel
-        else None
-    )
     stmt = (
         update(AutomationRun)
         .where(
@@ -2240,7 +2226,7 @@ async def cancel_run(
             status=AutomationRunStatus.CANCELLED,
             completed_at=now,
             error_detail="Cancelled by user",
-            status_detail=cancel_status_detail,
+            status_detail=None,
         )
     )
     db_result: CursorResult = await session.execute(stmt)  # type: ignore[assignment]
@@ -2270,13 +2256,26 @@ async def cancel_run(
     # run and pay a lookup for a sandbox we just deleted. The key stays on the
     # row as the record of what this run was about.
     if governed_cancel:
-        # A governed run cancels as interrupt + delete of its conversation,
-        # never by stopping a bash command.
+        # A governed run cancels as an interrupt and a release, never by
+        # stopping a bash command. The release honors retain_transcript:
+        # a retained transcript survives cancellation.
         from openhands.automation.backends.governed import (
             cancel_governed_conversation,
         )
 
-        await cancel_governed_conversation(get_http_client(request), run)
+        outcome = await cancel_governed_conversation(
+            get_http_client(request),
+            run,
+            retain_transcript=automation.retain_transcript,
+        )
+        if outcome is not None:
+            run.status_detail = transcript_status_detail(outcome)
+            if outcome is TranscriptOutcome.RELEASE_FAILED:
+                # The janitor retries; an unstopped governed sandbox would
+                # otherwise keep running after the run is terminal.
+                run.sandbox_cleanup_due_at = utcnow()
+            await session.commit()
+            await session.refresh(run)
     elif run.sandbox_id:
         if run.subject_key and run.subject_released_at is None:
             run.subject_released_at = utcnow()

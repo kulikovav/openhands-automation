@@ -9,13 +9,14 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
+from openhands.automation.backends.governed import TranscriptOutcome
 from openhands.automation.config import clear_config_cache
 from openhands.automation.dispatcher import _execute_run
 from openhands.automation.execution import DispatchResult
@@ -88,10 +89,18 @@ async def test_cancel_running_run(async_client, async_session):
     assert data["status"] == "CANCELLED"
 
 
-async def test_cancel_governed_run_marks_the_transcript_unavailable(
-    async_client, async_session
+@pytest.mark.parametrize(
+    ("outcome", "code", "retain_transcript"),
+    [
+        (TranscriptOutcome.RETAINED, "transcript_retained", True),
+        (TranscriptOutcome.UNAVAILABLE, "transcript_unavailable", False),
+        (TranscriptOutcome.RELEASE_FAILED, "release_failed", True),
+    ],
+)
+async def test_cancel_governed_run_records_the_release_outcome(
+    async_client, async_session, outcome, code, retain_transcript
 ):
-    """Cancellation deletes a governed conversation even when runs retain it."""
+    """Cancellation attempts a governed release and records its outcome."""
     automation = Automation(
         user_id=TEST_USER_ID,
         org_id=TEST_ORG_ID,
@@ -99,6 +108,7 @@ async def test_cancel_governed_run_marks_the_transcript_unavailable(
         trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
         tarball_path="https://example.com/code.tar.gz",
         entrypoint="python main.py",
+        retain_transcript=retain_transcript,
     )
     async_session.add(automation)
     await async_session.flush()
@@ -109,8 +119,8 @@ async def test_cancel_governed_run_marks_the_transcript_unavailable(
         status=AutomationRunStatus.RUNNING,
         started_at=utcnow(),
         execution_claim={
-            "target_id": "gone",
-            "target_url": "https://gone.invalid",
+            "target_id": "governed-1",
+            "target_url": "https://governed.example:8443",
             "conversation_id": str(uuid.uuid4()),
             "claimed_at": utcnow().isoformat(),
         },
@@ -118,11 +128,25 @@ async def test_cancel_governed_run_marks_the_transcript_unavailable(
     async_session.add(run)
     await async_session.flush()
 
-    resp = await async_client.post(f"/api/automation/v1/runs/{run.id}/cancel")
+    with patch(
+        "openhands.automation.backends.governed.cancel_governed_conversation",
+        new_callable=AsyncMock,
+        return_value=outcome,
+    ) as cancel:
+        resp = await async_client.post(f"/api/automation/v1/runs/{run.id}/cancel")
+
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "CANCELLED"
-    assert data["status_detail"]["code"] == "transcript_unavailable"
+    assert data["status_detail"]["code"] == code
+    cancel.assert_awaited_once()
+    assert cancel.await_args is not None
+    assert cancel.await_args.kwargs["retain_transcript"] is retain_transcript
+    await async_session.refresh(run)
+    if outcome is TranscriptOutcome.RELEASE_FAILED:
+        assert run.sandbox_cleanup_due_at is not None
+    else:
+        assert run.sandbox_cleanup_due_at is None
 
 
 async def test_cancel_completed_run_returns_409(async_client, async_session):

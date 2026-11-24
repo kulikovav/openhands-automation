@@ -39,6 +39,7 @@ from openhands.automation.backends import ExecutionBackend, get_backend
 from openhands.automation.backends.governed import (
     ExecutionClaim,
     GovernedConversationBackend,
+    TranscriptOutcome,
     release_conversation,
     transcript_status_detail,
 )
@@ -109,7 +110,8 @@ async def _get_automation_retain_transcript(
     """Return parent automation retention without extra SQL when preloaded.
 
     An unreadable parent keeps the transcript: the deployment's retention
-    reclaimer still bounds it, while deleting one is irreversible.
+    reclaimer archives the stopped runtime after the retention window, while
+    the conversation record remains, so deleting one is irreversible.
     """
     if "automation" not in inspect(run).unloaded and run.automation is not None:
         return run.automation.retain_transcript
@@ -734,6 +736,16 @@ async def _reconcile_governed_run(
             AutomationRunStatus.COMPLETED,
             status_detail=transcript_status_detail(outcome),
         )
+        if outcome is TranscriptOutcome.RELEASE_FAILED:
+            # Nothing else stops a governed sandbox: the janitor retries the
+            # release on its next scan, because a failed one leaves it running.
+            async with session_factory() as session:
+                await session.execute(
+                    update(AutomationRun)
+                    .where(AutomationRun.id == run.id)
+                    .values(sandbox_cleanup_due_at=now)
+                )
+                await session.commit()
         run.status = AutomationRunStatus.COMPLETED
         await capture_automation_event(
             "automation_run_completed",
@@ -1149,12 +1161,12 @@ async def cleanup_due_sandboxes(
 ) -> int:
     """Delete sandboxes whose deferred cleanup is due, one bounded batch per scan.
 
-    Rows are stamped by ``complete_run`` and ``_verify_and_mark_run`` when the
-    service runs with a cleanup delay. The stamp is cleared after one attempt
-    whatever the outcome: deletion is best-effort here exactly as on the
-    immediate path (which never retries either), and the runtime's own TTL
-    reaper is the backstop, so a sandbox that will not delete cannot pin the
-    sweep forever.
+    Rows are stamped by ``complete_run``, ``_verify_and_mark_run`` and a failed
+    governed release in the reconcile path. The stamp is cleared after one
+    attempt whatever the outcome, except a governed release failure: nothing
+    else stops that sandbox, so ``False`` or an exception from the backend
+    keeps the stamp due and the next scan retries. A successful retry clears
+    the stamp and leaves the initial ``release_failed`` detail in place.
     """
     now = utcnow()
     async with session_factory() as session:
@@ -1185,11 +1197,24 @@ async def cleanup_due_sandboxes(
             if run is None:
                 continue
             extra = log_extra(run_id=str(run_id), sandbox_id=run.sandbox_id)
+            governed = bool(run.execution_claim) and not run.sandbox_id
+            retry = False
             try:
-                if run.sandbox_id:
-                    await get_backend(run).cleanup_after_verification(str(run_id))
+                if run.sandbox_id or run.execution_claim:
+                    retry = (
+                        await get_backend(run).cleanup_after_verification(str(run_id))
+                    ) is False
             except Exception as e:
+                # A governed sandbox has no other reaper, so an unexpected
+                # failure keeps the stamp; non-governed cleanup stays best-effort.
+                retry = governed
                 logger.warning("Deferred sandbox cleanup failed: %s", e, extra=extra)
+            if retry:
+                logger.warning(
+                    "Deferred governed release failed; keeping the stamp for retry",
+                    extra=extra,
+                )
+                continue
             try:
                 await session.execute(
                     update(AutomationRun)
