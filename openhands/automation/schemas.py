@@ -507,6 +507,13 @@ TAGS_DESCRIPTION: Final[str] = (
     "10 tags of up to 50 characters."
 )
 
+RETAIN_TRANSCRIPT_DESCRIPTION: Final[str] = (
+    "Governed runs only: stop the sandbox at terminal state but keep the "
+    "conversation and its transcript for the deployment retention window. "
+    "False deletes the conversation immediately. Does not affect cloud "
+    "sandbox cleanup (keep_alive)."
+)
+
 
 RUN_AS_USER_ID_DESCRIPTION = (
     "Run the automation as this service account of the organization instead "
@@ -630,6 +637,9 @@ class CreateAutomationRequest(BaseModel):
             "finishes. If false or null, explicitly clean it up after "
             "completion (or after post-run callbacks, when configured)."
         ),
+    )
+    retain_transcript: bool = Field(
+        default=True, description=RETAIN_TRANSCRIPT_DESCRIPTION
     )
     enabled: bool = Field(
         default=True,
@@ -829,6 +839,13 @@ class UpdateAutomationRequest(BaseModel):
         description=build_automation_timeout_description(include_default=False),
     )
     keep_alive: bool | None = Field(default=None)
+    retain_transcript: bool | None = Field(
+        default=None,
+        description=(
+            f"{RETAIN_TRANSCRIPT_DESCRIPTION} Omit to leave it unchanged; "
+            "null is rejected."
+        ),
+    )
     enabled: bool | None = Field(
         default=None,
         deprecated=True,
@@ -850,7 +867,14 @@ class UpdateAutomationRequest(BaseModel):
 
     # state is NOT NULL too, but an explicit null there has always been a
     # no-op (the handler skips it), so it is left out on purpose.
-    @field_validator("name", "trigger", "tarball_path", "entrypoint", "enabled")
+    @field_validator(
+        "name",
+        "trigger",
+        "tarball_path",
+        "entrypoint",
+        "enabled",
+        "retain_transcript",
+    )
     @classmethod
     def validate_not_null(cls, v: Any, info: ValidationInfo) -> Any:
         return reject_explicit_null(v, info)
@@ -1326,6 +1350,7 @@ class AutomationResponse(BaseModel):
     entrypoint: str
     timeout: int | None
     keep_alive: bool | None
+    retain_transcript: bool = True
     enabled: bool = Field(
         deprecated=True,
         description=(

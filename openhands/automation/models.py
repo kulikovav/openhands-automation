@@ -199,6 +199,14 @@ class Automation(Base):
     # means the automation service owns explicit cleanup.
     keep_alive: Mapped[bool | None] = mapped_column(default=None, nullable=True)
 
+    # Governed runs only: stop the sandbox at terminal state but keep the
+    # conversation and its events for the deployment retention window. False
+    # deletes the conversation immediately. Independent of keep_alive, which
+    # is the cloud sandbox cleanup flag.
+    retain_transcript: Mapped[bool] = mapped_column(
+        default=True, nullable=False, server_default=text("true")
+    )
+
     # Deprecated: use state instead. Kept for backwards
     # compatibility; only ACTIVE rows have enabled=True. Will be removed in a
     # future release.

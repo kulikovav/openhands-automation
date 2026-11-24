@@ -40,6 +40,7 @@ from openhands.automation.backends.governed import (
     ExecutionClaim,
     GovernedConversationBackend,
     release_conversation,
+    transcript_status_detail,
 )
 from openhands.automation.backends.local import local_runs_root
 from openhands.automation.config import Settings, get_config
@@ -100,6 +101,23 @@ async def _get_automation_keep_alive(
     return await session.scalar(
         select(Automation.keep_alive).where(Automation.id == run.automation_id)
     )
+
+
+async def _get_automation_retain_transcript(
+    session: AsyncSession, run: AutomationRun
+) -> bool:
+    """Return parent automation retention without extra SQL when preloaded.
+
+    An unreadable parent keeps the transcript: the deployment's retention
+    reclaimer still bounds it, while deleting one is irreversible.
+    """
+    if "automation" not in inspect(run).unloaded and run.automation is not None:
+        return run.automation.retain_transcript
+
+    value = await session.scalar(
+        select(Automation.retain_transcript).where(Automation.id == run.automation_id)
+    )
+    return True if value is None else value
 
 
 async def _get_automation_timeout(
@@ -631,9 +649,8 @@ async def _reconcile_governed_run(
     if claim is None:
         return False
     backend = get_backend(run)
-    keep_alive: bool | None = None
     async with session_factory() as session:
-        keep_alive = await _get_automation_keep_alive(session, run)
+        retain_transcript = await _get_automation_retain_transcript(session, run)
 
     if not isinstance(backend, GovernedConversationBackend) or backend.target is None:
         await mark_run_terminal(
@@ -672,7 +689,9 @@ async def _reconcile_governed_run(
             await backend.interrupt(client, claim.conversation_id)
         except Exception as e:
             logger.warning("Interrupt at timeout failed: %s", e, extra=extra)
-        await release_conversation(client, backend, claim, keep_alive=keep_alive)
+        await release_conversation(
+            client, backend, claim, retain_transcript=retain_transcript
+        )
         error_msg = "no terminal conversation state received"
         await mark_run_terminal(
             session_factory,
@@ -705,9 +724,17 @@ async def _reconcile_governed_run(
         return False
 
     if state.kind == "completed":
-        await mark_run_terminal(session_factory, run, AutomationRunStatus.COMPLETED)
+        # Release first so the COMPLETED run records what the release kept.
+        outcome = await release_conversation(
+            client, backend, claim, retain_transcript=retain_transcript
+        )
+        await mark_run_terminal(
+            session_factory,
+            run,
+            AutomationRunStatus.COMPLETED,
+            status_detail=transcript_status_detail(outcome),
+        )
         run.status = AutomationRunStatus.COMPLETED
-        await release_conversation(client, backend, claim, keep_alive=keep_alive)
         await capture_automation_event(
             "automation_run_completed",
             automation=_loaded_automation(run),
@@ -743,7 +770,9 @@ async def _reconcile_governed_run(
     )
     run.status = AutomationRunStatus.FAILED
     run.error_detail = state.detail
-    await release_conversation(client, backend, claim, keep_alive=keep_alive)
+    await release_conversation(
+        client, backend, claim, retain_transcript=retain_transcript
+    )
     await capture_automation_event(
         "automation_run_failed",
         automation=_loaded_automation(run),

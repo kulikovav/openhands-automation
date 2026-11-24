@@ -36,6 +36,7 @@ class RunStatusDetailKind(StrEnum):
     LICENSE_LIMIT = "license_limit"
     BLOCKED = "blocked"
     AUTH = "auth"
+    CLEANUP = "cleanup"
     UNKNOWN = "unknown"
 
 

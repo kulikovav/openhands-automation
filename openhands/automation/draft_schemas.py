@@ -119,6 +119,7 @@ class _BaseDraftBody(BaseModel):
     trigger: DraftTrigger | None = None
     timeout: int | None = None
     keep_alive: bool | None = None
+    retain_transcript: bool | None = None
     enabled: bool | None = None
     state: AutomationState | None = None
     template: TemplateProvenance | None = None

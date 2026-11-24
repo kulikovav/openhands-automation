@@ -469,6 +469,7 @@ async def _materialize_raw_draft(
         "entrypoint": body.entrypoint,
         "timeout": default_automation_timeout(body.timeout),
         "keep_alive": body.keep_alive,
+        "retain_transcript": body.retain_transcript,
     }
 
 
@@ -510,6 +511,7 @@ async def _materialize_prompt_draft(
         "entrypoint": _get_preset_entrypoint(),
         "timeout": default_automation_timeout(body.timeout),
         "keep_alive": body.keep_alive,
+        "retain_transcript": body.retain_transcript,
     }
 
 
@@ -563,6 +565,7 @@ async def _materialize_plugin_draft(
         "entrypoint": _get_preset_entrypoint(),
         "timeout": default_automation_timeout(body.timeout),
         "keep_alive": body.keep_alive,
+        "retain_transcript": body.retain_transcript,
     }
 
 

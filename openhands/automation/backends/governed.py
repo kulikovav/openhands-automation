@@ -23,10 +23,11 @@ import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openhands.automation.backends.base import (
@@ -39,6 +40,11 @@ from openhands.automation.targets import AutomationTarget, resolve_target
 from openhands.automation.utils.agent_server import (
     VerificationOutcome,
     VerificationResult,
+)
+from openhands.automation.utils.run_status_detail import (
+    RunStatusDetailKind,
+    RunStatusPhase,
+    make_run_status_detail,
 )
 from openhands.automation.utils.time import ensure_utc, utcnow
 
@@ -69,6 +75,46 @@ _RUNTIME_MISSING_STATUSES: Final[frozenset[str]] = frozenset(
     {"missing", "ownership_lost", "error"}
 )
 _CONVERSATION_FAILED_STATUSES: Final[frozenset[str]] = frozenset({"error", "stuck"})
+
+TRANSCRIPT_RETAINED: Final[str] = "transcript_retained"
+TRANSCRIPT_UNAVAILABLE: Final[str] = "transcript_unavailable"
+
+
+class TranscriptOutcome(StrEnum):
+    """What a terminal governed release left behind for later review."""
+
+    RETAINED = TRANSCRIPT_RETAINED
+    UNAVAILABLE = TRANSCRIPT_UNAVAILABLE
+    RELEASE_FAILED = "release_failed"
+
+    @property
+    def status_detail_code(self) -> str | None:
+        """The COMPLETED run's status-detail code, or None when it failed."""
+        return None if self is TranscriptOutcome.RELEASE_FAILED else self.value
+
+
+def transcript_status_detail(outcome: TranscriptOutcome) -> dict[str, Any] | None:
+    """The status detail for a COMPLETED run's transcript outcome.
+
+    A failed release establishes neither outcome, so it carries no code and
+    the UI shows no transcript link.
+    """
+    code = outcome.status_detail_code
+    if code is None:
+        return None
+    return make_run_status_detail(
+        phase=RunStatusPhase.CLEANUP,
+        kind=RunStatusDetailKind.CLEANUP,
+        detail=(
+            "Runtime stopped; conversation and transcript retained"
+            if outcome is TranscriptOutcome.RETAINED
+            else "Conversation and transcript deleted"
+        ),
+        transient=False,
+        source="automation_service",
+        operation="release_conversation",
+        code=code,
+    )
 
 
 def governed_conversation_id_for(run_id: uuid.UUID | str) -> str:
@@ -302,7 +348,7 @@ class GovernedConversationBackend(ExecutionBackend):
         ctx: ExecutionContext,  # noqa: ARG002
     ) -> None:
         # The conversation lifecycle is explicit: released at terminal by the
-        # reconcile path (DELETE unless keep_alive), never implicitly here.
+        # reconcile path according to retain_transcript, never implicitly here.
         return None
 
     async def get_api_key(self) -> str:
@@ -512,12 +558,49 @@ class GovernedConversationBackend(ExecutionBackend):
 
     async def delete_conversation(
         self, client: httpx.AsyncClient, conversation_id: str
-    ) -> None:
+    ) -> bool:
+        """Delete the conversation record and its events. True on success."""
         target = self._require_target()
-        await client.delete(
+        response = await client.delete(
             f"{target.url}/api/conversations/{conversation_id}",
             headers=self._headers(),
         )
+        if not response.is_success:
+            logger.warning(
+                "Could not delete governed conversation %s (HTTP %s)",
+                conversation_id,
+                response.status_code,
+            )
+        return response.is_success
+
+    async def release_runtime(
+        self, client: httpx.AsyncClient, conversation_id: str
+    ) -> bool:
+        """Stop the conversation's sandbox, keeping the record and events."""
+        target = self._require_target()
+        response = await client.delete(
+            f"{target.url}/api/conversations/{conversation_id}/runtime",
+            headers=self._headers(),
+        )
+        if not response.is_success:
+            logger.warning(
+                "Could not stop the governed runtime of conversation %s (HTTP %s)",
+                conversation_id,
+                response.status_code,
+            )
+        return response.is_success
+
+    def retains_transcript(self) -> bool:
+        """The automation's retention decision, when its parent is loaded.
+
+        Deleting a transcript the setting says to keep is irreversible, so an
+        unavailable parent falls back to retention; the deployment reclaimer
+        still bounds it.
+        """
+        run = self._run
+        if "automation" in inspect(run).unloaded or run.automation is None:
+            return True
+        return run.automation.retain_transcript
 
     async def verify_run(self, run_id: str) -> VerificationResult:  # noqa: ARG002
         """Contract completeness: the reconcile path owns governed liveness."""
@@ -546,7 +629,17 @@ class GovernedConversationBackend(ExecutionBackend):
         if claim is None:
             return
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await self.delete_conversation(client, claim.conversation_id)
+            outcome = await release_conversation(
+                client,
+                self,
+                claim,
+                retain_transcript=self.retains_transcript(),
+            )
+        if outcome is TranscriptOutcome.RELEASE_FAILED:
+            logger.warning(
+                "Could not release governed conversation %s after verification",
+                claim.conversation_id,
+            )
 
     async def stop_command(self, command_id: str) -> None:  # noqa: ARG002
         # No bash command exists; cancellation maps to interrupt + delete (see
@@ -559,22 +652,29 @@ async def release_conversation(
     backend: GovernedConversationBackend,
     claim: ExecutionClaim,
     *,
-    keep_alive: bool | None,
-) -> None:
-    """Release the runtime at terminal: DELETE unless keep_alive keeps it.
+    retain_transcript: bool,
+) -> TranscriptOutcome:
+    """Stop a terminal governed conversation and settle its transcript.
 
-    A missing runtime is never recreated; the delete is best-effort.
+    ``retain_transcript`` stops the sandbox but keeps the conversation record
+    and its events; false deletes the conversation. A non-success response or
+    a transport error leaves the transcript state unknown and is reported as
+    ``RELEASE_FAILED``, never as a retained transcript.
     """
-    if keep_alive is True:
-        return
     try:
-        await backend.delete_conversation(client, claim.conversation_id)
+        if retain_transcript:
+            if await backend.release_runtime(client, claim.conversation_id):
+                return TranscriptOutcome.RETAINED
+        elif await backend.delete_conversation(client, claim.conversation_id):
+            return TranscriptOutcome.UNAVAILABLE
     except Exception as exc:
         logger.warning(
             "Could not release governed conversation %s: %s",
             claim.conversation_id,
             exc,
         )
+        return TranscriptOutcome.RELEASE_FAILED
+    return TranscriptOutcome.RELEASE_FAILED
 
 
 async def cancel_governed_conversation(
@@ -583,8 +683,9 @@ async def cancel_governed_conversation(
 ) -> None:
     """Cancellation: interrupt the conversation, then delete it.
 
-    Explicit cancellation deletes even when the automation keeps its runtime
-    alive, exactly as a cancelled cloud run loses its sandbox.
+    Explicit cancellation deletes the conversation even when the automation
+    retains transcripts at terminal state, exactly as a cancelled cloud run
+    loses its sandbox.
     """
     claim = ExecutionClaim.from_dict(run.execution_claim)
     if claim is None:
