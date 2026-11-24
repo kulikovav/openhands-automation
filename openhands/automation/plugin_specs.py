@@ -38,6 +38,7 @@ from openhands.automation.observability_associations import (
 )
 from openhands.automation.schemas import (
     FACTORY_ID_DESCRIPTION,
+    RETAIN_TRANSCRIPT_DESCRIPTION,
     RUN_AS_USER_ID_DESCRIPTION,
     VISIBILITY_DESCRIPTION,
     CronTrigger,
@@ -443,6 +444,9 @@ class CreatePluginSpecAutomationRequest(BaseModel):
     observability_associations: dict[str, str] | None = None
     timeout: int | None = None
     keep_alive: bool | None = None
+    retain_transcript: bool = Field(
+        default=True, description=RETAIN_TRANSCRIPT_DESCRIPTION
+    )
     template: TemplateProvenance | None = None
     enabled: bool = True
     state: PublicAutomationState | None = None

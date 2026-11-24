@@ -3858,6 +3858,20 @@ class TestPresetContinueConversationKeepAlive:
 
         assert PRESET_MODELS[endpoint].model_validate(body).keep_alive is True
 
+    def test_retain_transcript_defaults_on(self, endpoint):
+        body = {**PRESET_BODIES[endpoint], "trigger": CONTINUING_TRIGGER}
+
+        assert PRESET_MODELS[endpoint].model_validate(body).retain_transcript is True
+
+    def test_retain_transcript_accepts_an_opt_out(self, endpoint):
+        body = {
+            **PRESET_BODIES[endpoint],
+            "trigger": CONTINUING_TRIGGER,
+            "retain_transcript": False,
+        }
+
+        assert PRESET_MODELS[endpoint].model_validate(body).retain_transcript is False
+
     def test_keep_alive_false_is_refused(self, endpoint):
         body = {
             **PRESET_BODIES[endpoint],

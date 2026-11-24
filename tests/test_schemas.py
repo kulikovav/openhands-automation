@@ -347,6 +347,11 @@ class TestAutomationResponseUtcSerialisation:
             "Z"
         )
 
+    def test_retain_transcript_is_returned(self):
+        automation = self._make_automation(retain_transcript=False)
+
+        assert automation.model_dump(mode="json")["retain_transcript"] is False
+
     def test_naive_last_triggered_at_serialises_with_utc_offset(self):
         automation = self._make_automation()
         data = automation.model_dump(mode="json")
@@ -358,3 +363,35 @@ class TestAutomationResponseUtcSerialisation:
         automation = self._make_automation(last_triggered_at=None)
         data = automation.model_dump(mode="json")
         assert data["last_triggered_at"] is None
+
+
+class TestRetainTranscriptField:
+    """The governed transcript setting defaults on and is optional on update."""
+
+    def _create_request(self, **overrides: Any) -> CreateAutomationRequest:
+        body: dict[str, Any] = dict(
+            name="Retention",
+            trigger=CronTrigger(schedule="0 9 * * *", timezone="UTC"),
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="python main.py",
+        )
+        body.update(overrides)
+        return CreateAutomationRequest(**body)
+
+    def test_create_defaults_to_retention(self):
+        assert self._create_request().retain_transcript is True
+
+    def test_create_accepts_an_opt_out(self):
+        assert self._create_request(retain_transcript=False).retain_transcript is False
+
+    def test_update_defaults_to_omitted(self):
+        assert UpdateAutomationRequest().retain_transcript is None
+
+    def test_update_accepts_a_decision(self):
+        assert (
+            UpdateAutomationRequest(retain_transcript=False).retain_transcript is False
+        )
+
+    def test_update_rejects_an_explicit_null(self):
+        with pytest.raises(ValidationError):
+            UpdateAutomationRequest(retain_transcript=None)

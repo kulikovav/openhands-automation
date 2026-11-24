@@ -940,6 +940,7 @@ class TestCreateAutomation:
         assert data["setup_script_path"] == "setup.sh"
         assert data["entrypoint"] == "uv run script.py"
         assert data["keep_alive"] is None
+        assert data["retain_transcript"] is True
         assert data["enabled"] is True
         assert "id" in data
         assert data["user_id"] == str(TEST_USER_ID)
@@ -1486,6 +1487,21 @@ class TestCreateAutomation:
 
         assert response.status_code == 201
         assert response.json()["keep_alive"] is False
+
+    async def test_create_automation_with_retain_transcript_false(self, async_client):
+        """An automation can delete its governed transcript at terminal state."""
+        payload = {
+            "name": "No Transcript",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "retain_transcript": False,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        assert response.json()["retain_transcript"] is False
 
     async def test_create_automation_invalid_keep_alive_rejected(self, async_client):
         """Invalid keep_alive value returns 422."""
@@ -3413,6 +3429,34 @@ class TestUpdateAutomation:
 
         assert response.status_code == 200
         assert response.json()["name"] == "Renamed"
+
+    async def test_update_retain_transcript_only_when_sent(
+        self, async_client, async_session
+    ):
+        """PATCH omits retention to keep it; an explicit value changes it."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Retention Update",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            retain_transcript=False,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        path = f"/api/automation/v1/{automation.id}"
+        omitted = await async_client.patch(path, json={"name": "Renamed"})
+        assert omitted.status_code == 200
+        assert omitted.json()["retain_transcript"] is False
+
+        enabled = await async_client.patch(path, json={"retain_transcript": True})
+        assert enabled.status_code == 200
+        assert enabled.json()["retain_transcript"] is True
+
+        explicit_null = await async_client.patch(path, json={"retain_transcript": None})
+        assert explicit_null.status_code == 422
 
     async def test_update_automation_timeout(self, async_client, async_session):
         """Can update automation timeout."""

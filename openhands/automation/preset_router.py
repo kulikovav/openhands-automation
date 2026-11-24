@@ -70,6 +70,7 @@ from openhands.automation.plugin_specs import (
 )
 from openhands.automation.schemas import (
     FACTORY_ID_DESCRIPTION,
+    RETAIN_TRANSCRIPT_DESCRIPTION,
     RUN_AS_USER_ID_DESCRIPTION,
     VISIBILITY_DESCRIPTION,
     AutomationResponse,
@@ -269,6 +270,9 @@ class CreatePromptAutomationRequest(BaseModel):
             "finishes. If false or null, explicitly clean it up after "
             "completion (or after post-run callbacks, when configured)."
         ),
+    )
+    retain_transcript: bool = Field(
+        default=True, description=RETAIN_TRANSCRIPT_DESCRIPTION
     )
     repos: list[RepoSource] | None = Field(
         default=None,
@@ -789,6 +793,7 @@ async def create_automation_from_prompt(
             entrypoint=_get_preset_entrypoint(),
             timeout=default_automation_timeout(body.timeout),
             keep_alive=body.keep_alive,
+            retain_transcript=body.retain_transcript,
             enabled=automation_state_enabled(state),
             state=state,
             telemetry_distinct_id=get_request_telemetry_context(
@@ -958,6 +963,9 @@ class CreatePluginAutomationRequest(BaseModel):
             "finishes. If false or null, explicitly clean it up after "
             "completion (or after post-run callbacks, when configured)."
         ),
+    )
+    retain_transcript: bool = Field(
+        default=True, description=RETAIN_TRANSCRIPT_DESCRIPTION
     )
     repos: list[RepoSource] | None = Field(
         default=None,
@@ -1375,6 +1383,7 @@ async def create_automation_from_plugin(
             entrypoint=_get_preset_entrypoint(),
             timeout=default_automation_timeout(body.timeout),
             keep_alive=body.keep_alive,
+            retain_transcript=body.retain_transcript,
             enabled=automation_state_enabled(state),
             state=state,
             telemetry_distinct_id=get_request_telemetry_context(

@@ -296,6 +296,16 @@ async def test_continuing_preset_draft_follows_the_keep_alive_rule(
     automation = await async_session.get(Automation, draft.materialized_automation_id)
     assert automation is not None
     assert automation.keep_alive is True
+    assert automation.retain_transcript is True
+
+
+def test_draft_body_accepts_the_retention_opt_out():
+    """A draft keeps an explicit transcript decision for its test dispatch."""
+    from openhands.automation.draft_schemas import normalize_draft_body
+
+    normalized = normalize_draft_body("/v1", {"retain_transcript": False})
+
+    assert normalized["retain_transcript"] is False
 
 
 async def test_dispatchable_prompt_draft_materializes_disabled_draft_and_manual_run(
