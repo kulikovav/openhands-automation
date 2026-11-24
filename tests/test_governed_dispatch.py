@@ -3,6 +3,8 @@
 import json
 import uuid
 from datetime import timedelta
+from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -45,6 +47,9 @@ TARGET_ENTRY = {
     "agent_profile_id": PROFILE_ID,
 }
 
+# Distinguishes "no override" from a scripted ``null`` JSON body.
+_UNSET = object()
+
 
 @pytest.fixture(autouse=True)
 def reset_config_cache():
@@ -83,6 +88,12 @@ class FakeGovernedServer:
         self.records: dict[str, tuple[int, dict]] = {}
         self.create_acks: list[int | str] = []
         self.fail_create_with_read_timeout = False
+        self.secrets: list[dict] = []
+        self.secret_status = 200
+        self.secret_queries: list[dict] = []
+        self.secret_body: object = _UNSET
+        self.capabilities: list[str] = ["conversation_repositories_v1"]
+        self.payloads: list[dict] = []
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
@@ -94,8 +105,20 @@ class FakeGovernedServer:
         method, path = request.method, request.url.path
         self.requests.append((method, path))
 
+        if method == "GET" and path == "/api/settings/secrets":
+            self.secret_queries.append(dict(request.url.params))
+            if self.secret_status >= 400:
+                return httpx.Response(self.secret_status, json={"detail": "refused"})
+            if self.secret_body is not _UNSET:
+                return httpx.Response(200, json=self.secret_body)
+            return httpx.Response(200, json={"secrets": self.secrets})
+
+        if method == "GET" and path == "/server_info":
+            return httpx.Response(200, json={"capabilities": self.capabilities})
+
         if method == "POST" and path == "/api/conversations":
             payload = json.loads(request.content)
+            self.payloads.append(payload)
             conversation_id = payload["conversation_id"]
             self.created.append(conversation_id)
             async with self.session_factory() as session:
@@ -159,15 +182,19 @@ async def make_run(
     target_id: str | None = TARGET_ID,
     retain_transcript: bool = True,
     timeout_at=None,
+    repos: list[Any] | None = None,
 ):
     async with session_factory() as session:
+        preset_metadata: dict = {"preset_type": "prompt"}
+        if repos is not None:
+            preset_metadata["repos"] = repos
         automation = Automation(
             id=uuid.uuid4(),
             user_id=TEST_USER_ID,
             created_by_user_id=TEST_USER_ID,
             org_id=TEST_ORG_ID,
             name="Governed",
-            preset_metadata={"preset_type": "prompt"},
+            preset_metadata=preset_metadata,
             prompt="Do the thing",
             trigger={"type": "cron", "schedule": "0 9 * * 1", "timezone": "UTC"},
             tarball_path="https://example.com/automation.tar.gz",
@@ -286,6 +313,210 @@ class TestDispatchOnce:
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail["code"] == "target_unavailable"
         assert server.requests == []
+
+
+class TestConfiguredSecretsAndRepositories:
+    """A governed start carries the target's secrets and its pre-clone repos."""
+
+    async def test_the_start_carries_the_configured_secrets(
+        self, async_session_factory, targets_env
+    ):
+        """The same LookupSecret references a direct conversation sends."""
+        run = await make_run(async_session_factory)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [
+            {"name": "GITHUB_TOKEN", "description": "GitHub"},
+            {"name": "GITLAB_TOKEN", "description": None},
+        ]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        secrets = payload["secrets"]
+        assert set(secrets) == {"GITHUB_TOKEN", "GITLAB_TOKEN"}
+        assert secrets["GITHUB_TOKEN"]["kind"] == "LookupSecret"
+        assert secrets["GITHUB_TOKEN"]["description"] == "GitHub"
+        # The same auth header Canvas sends with each lookup, so an
+        # out-of-process resolver can read the name.
+        assert secrets["GITHUB_TOKEN"]["headers"] == {
+            "X-Session-API-Key": TARGET_SECRET
+        }
+        assert urlsplit(secrets["GITHUB_TOKEN"]["url"]).path == (
+            "/api/settings/secrets/GITHUB_TOKEN"
+        )
+        assert secrets["GITLAB_TOKEN"]["kind"] == "LookupSecret"
+        assert urlsplit(secrets["GITLAB_TOKEN"]["url"]).path == (
+            "/api/settings/secrets/GITLAB_TOKEN"
+        )
+        assert "description" not in secrets["GITLAB_TOKEN"]
+        # The list is scoped to the target's agent profile, as the preset
+        # runner's get_secrets(agent_profile_id=...) is.
+        assert server.secret_queries == [{"agent_profile_id": PROFILE_ID}]
+
+    async def test_the_start_preclones_a_repository_with_its_integration_secret(
+        self, async_session_factory, targets_env
+    ):
+        """A repository whose provider token is configured is cloned at start."""
+        repos = [
+            {"url": "https://github.com/acme/api", "ref": "main"},
+            {"url": "https://gitlab.com/acme/web"},
+        ]
+        run = await make_run(async_session_factory, repos=repos)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITHUB_TOKEN", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["repositories"] == [
+            {"url": "https://github.com/acme/api", "ref": "main"}
+        ]
+
+    async def test_a_repository_without_its_integration_secret_is_not_precloned(
+        self, async_session_factory, targets_env
+    ):
+        """The same condition the app server applies: no connection, no clone."""
+        run = await make_run(
+            async_session_factory,
+            repos=[{"url": "https://github.com/acme/api"}],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITLAB_TOKEN", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert "repositories" not in payload
+
+    async def test_a_commit_ref_is_precloned(self, async_session_factory, targets_env):
+        """The server clones a commit ref with a full clone plus a checkout."""
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        run = await make_run(
+            async_session_factory,
+            repos=[{"url": "https://github.com/acme/api", "ref": commit}],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITHUB_TOKEN", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["repositories"] == [
+            {"url": "https://github.com/acme/api", "ref": commit}
+        ]
+
+    async def test_a_string_form_repository_is_precloned(
+        self, async_session_factory, targets_env
+    ):
+        """A bare URL is a repository form the server validates and clones."""
+        run = await make_run(
+            async_session_factory, repos=["https://github.com/acme/api"]
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITHUB_TOKEN", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["repositories"] == [{"url": "https://github.com/acme/api"}]
+
+    async def test_a_lowercase_token_name_is_precloned(
+        self, async_session_factory, targets_env
+    ):
+        """The server's fetcher resolves either spelling of the provider token."""
+        run = await make_run(
+            async_session_factory,
+            repos=[{"url": "https://github.com/acme/api"}],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "github_token", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["repositories"] == [{"url": "https://github.com/acme/api"}]
+
+    async def test_ssh_and_file_urls_are_not_precloned(
+        self, async_session_factory, targets_env
+    ):
+        """Neither URL form can carry a provider token, and no runner exists."""
+        run = await make_run(
+            async_session_factory,
+            repos=[
+                {"url": "git@github.com:acme/api.git"},
+                {"url": "file:///tmp/acme/api"},
+            ],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITHUB_TOKEN", "description": None}]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert "repositories" not in payload
+
+    async def test_a_target_without_the_clone_capability_fails_the_run(
+        self, async_session_factory, targets_env
+    ):
+        """A repository a pre-capability server would ignore is a visible failure."""
+        run = await make_run(
+            async_session_factory,
+            repos=[{"url": "https://github.com/acme/api"}],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secrets = [{"name": "GITHUB_TOKEN", "description": None}]
+        server.capabilities = []
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "repositories_unsupported"
+        assert server.posts("/api/conversations") == 0
+
+    async def test_a_null_secret_list_starts_the_run_without_secrets(
+        self, async_session_factory, targets_env
+    ):
+        """A 200 body that is not an object carries no secrets, not an error."""
+        run = await make_run(async_session_factory)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secret_body = None
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert "secrets" not in payload
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status != AutomationRunStatus.FAILED
+
+    async def test_an_unreadable_secret_list_does_not_block_the_start(
+        self, async_session_factory, targets_env
+    ):
+        """Secrets are best-effort, as in a preset run without them."""
+        run = await make_run(
+            async_session_factory,
+            repos=[{"url": "https://github.com/acme/api"}],
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.secret_status = 503
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["conversation_id"] == governed_conversation_id_for(run.id)
+        assert "secrets" not in payload
+        assert "repositories" not in payload
 
 
 class TestReconcileByState:
