@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import inspect, select, update
@@ -48,6 +49,7 @@ from openhands.automation.utils.run_status_detail import (
     make_run_status_detail,
 )
 from openhands.automation.utils.time import ensure_utc, utcnow
+from openhands.workspace import RepoSource
 
 
 if TYPE_CHECKING:
@@ -71,6 +73,19 @@ CLAIM_KEYS: Final[frozenset[str]] = frozenset(
 # still in flight, so a 404 on the claimed conversation is not proof of failure
 # during this window. The run timeout remains the outer bound.
 GOVERNED_START_GRACE_SECONDS: Final[int] = 300
+
+# The agent server's own settings routes, as a direct conversation addresses
+# them: a secret name becomes a LookupSecret the server resolves in-process
+# from the store it already holds. A relative URL is what Canvas sends, and it
+# keeps resolution on the server that receives the start.
+SECRETS_PATH: Final[str] = "/api/settings/secrets"
+SECRETS_TIMEOUT_SECONDS: Final[float] = 30.0
+
+# A server that predates the field accepts ``repositories`` (pydantic ignores
+# extras) and never clones it, so the start only names repositories to a
+# server that advertises this.
+SERVER_INFO_PATH: Final[str] = "/server_info"
+REPOSITORIES_CAPABILITY: Final[str] = "conversation_repositories_v1"
 
 _RUNTIME_MISSING_STATUSES: Final[frozenset[str]] = frozenset(
     {"missing", "ownership_lost", "error"}
@@ -126,6 +141,35 @@ def transcript_status_detail(outcome: TranscriptOutcome) -> dict[str, Any]:
 def governed_conversation_id_for(run_id: uuid.UUID | str) -> str:
     """The one conversation UUID a governed run may ever use (uuid5)."""
     return str(uuid.uuid5(GOVERNED_RUN_NAMESPACE, str(run_id)))
+
+
+def _preclone_repositories(
+    repos: list[Any] | None, secret_names: Collection[str]
+) -> list[dict[str, Any]]:
+    """The automation's repositories this target can clone with its secrets.
+
+    The gate is the receiving agent server's own ``RepoSource`` acceptance: a
+    string or a dict, a branch or tag, a commit ref (a full clone then a
+    checkout), and a short ``owner/repo`` name. A governed run has no runner to
+    clone what this drops, so a dropped repository leaves an empty workspace.
+    The provider token must be in the target's secret store under either the
+    upper- or lower-case spelling the server's fetcher resolves. An SSH or file
+    URL carries no provider token, so it is dropped.
+    """
+    names = {name.lower() for name in secret_names}
+    repositories: list[dict[str, Any]] = []
+    for repo in repos or []:
+        try:
+            source = RepoSource.model_validate(repo)
+            token_name = source.get_token_name()
+        except ValueError:
+            continue
+        if source.url.startswith(("git@", "file://")):
+            continue
+        if token_name.lower() not in names:
+            continue
+        repositories.append(source.model_dump(mode="json", exclude_none=True))
+    return repositories
 
 
 @dataclass(frozen=True)
@@ -375,6 +419,76 @@ class GovernedConversationBackend(ExecutionBackend):
         # No bash chain exists on a governed run.
         return {}
 
+    async def configured_secrets(self, client: httpx.AsyncClient) -> dict[str, Any]:
+        """The target's configured secrets, as a direct conversation sends them.
+
+        ``GET /api/settings/secrets`` names them only, scoped to the target's
+        agent profile, and each becomes a ``LookupSecret`` the server resolves
+        in-process from its own store. Raw values therefore never transit this
+        service. An unreadable or malformed list is empty, as a preset run
+        without them.
+        """
+        target = self._require_target()
+        params = (
+            {"agent_profile_id": target.agent_profile_id}
+            if target.agent_profile_id
+            else None
+        )
+        try:
+            response = await client.get(
+                f"{target.url}{SECRETS_PATH}",
+                params=params,
+                headers=self._headers(),
+                timeout=SECRETS_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            # The reference a direct conversation sends: a relative URL the
+            # receiving server resolves against its own base, and the session
+            # key header an out-of-process resolver needs. A lookup URL names a
+            # secret, never a value.
+            body = response.json()
+            items = body.get("secrets") if isinstance(body, dict) else None
+            secrets: dict[str, Any] = {}
+            for item in items or []:
+                name = item["name"]
+                secrets[name] = {
+                    "kind": "LookupSecret",
+                    "url": f"{SECRETS_PATH}/{quote(name, safe='')}",
+                    "headers": self._headers(),
+                    **(
+                        {"description": item["description"]}
+                        if item.get("description")
+                        else {}
+                    ),
+                }
+        except (
+            httpx.HTTPError,
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "Could not read the target's secrets, starting without them: %s", exc
+            )
+            return {}
+        return secrets
+
+    async def _advertises(self, client: httpx.AsyncClient, capability: str) -> bool:
+        """Whether the target's build serves ``capability`` on /server_info."""
+        target = self._require_target()
+        try:
+            response = await client.get(
+                f"{target.url}{SERVER_INFO_PATH}",
+                headers=self._headers(),
+                timeout=SECRETS_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            capabilities = response.json().get("capabilities")
+        except (httpx.HTTPError, AttributeError, ValueError):
+            return False
+        return isinstance(capabilities, list) and capability in capabilities
+
     async def start_conversation(
         self,
         client: httpx.AsyncClient,
@@ -399,6 +513,24 @@ class GovernedConversationBackend(ExecutionBackend):
                 "run": True,
             },
         }
+        # The configured secrets (by reference), and the repositories their
+        # provider tokens can clone. A server from before the clone field
+        # ignores it, so a run that names repositories is refused unless the
+        # target advertises that it clones them.
+        secrets = await self.configured_secrets(client)
+        if secrets:
+            payload["secrets"] = secrets
+        repositories = _preclone_repositories(preset.get("repos"), secrets.keys())
+        if repositories:
+            if not await self._advertises(client, REPOSITORIES_CAPABILITY):
+                return StartOutcome(
+                    error=(
+                        "Target cannot clone the run's repositories: it does "
+                        f"not advertise {REPOSITORIES_CAPABILITY}"
+                    ),
+                    code="repositories_unsupported",
+                )
+            payload["repositories"] = repositories
         if target.agent_profile_id:
             payload["agent_profile_id"] = target.agent_profile_id
         # Only where the run already carries them: a plain prompt preset has
