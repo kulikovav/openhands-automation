@@ -694,6 +694,8 @@ class TestWhichRunsStartThroughTheAppServer:
             _conversation_start(_automation(preset_metadata=None), _RUN, None, [], {})
             is None
         )
+
+    def test_script_bundle_is_left_alone(self):
         assert (
             _conversation_start(
                 _automation(preset_metadata={"template": {"id": "x"}}),

@@ -113,7 +113,7 @@ def test_classify_script_bundle_from_template_provenance():
     )
 
 
-def test_classify_upload_is_a_custom_tarball():
+def test_classify_external_url_is_a_custom_tarball():
     assert (
         classify_automation(
             None, None, "https://example.com/bundle.tar.gz", "bash run.sh"
@@ -341,6 +341,9 @@ class TestCreateValidation:
         )
         assert response.status_code == 422
         assert _error_codes(response) == [("target_id", "target_kind_unsupported")]
+        assert response.json()["detail"][0]["msg"] == (
+            f"Target {TARGET_NAME!r} does not run 'prompt' automations; it runs none."
+        )
 
     async def test_prompt_preset_on_target_accepted_at_create(
         self, async_client, targets_env

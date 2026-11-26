@@ -13,21 +13,16 @@ import json
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 
 
-# The four creation paths an automation can have. One union names a kind, and
+# The kinds the registry gates on. One union names a kind, and
 # ``classify_automation`` is the only place that decides one.
 AutomationKind = Literal["prompt", "script", "plugin", "custom_tarball"]
-AUTOMATION_KINDS: Final[tuple[AutomationKind, ...]] = (
-    "prompt",
-    "script",
-    "plugin",
-    "custom_tarball",
-)
+AUTOMATION_KINDS: Final[tuple[AutomationKind, ...]] = get_args(AutomationKind)
 
 # Exactly these keys are allowed on an entry; anything else is a startup error.
 TARGET_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
@@ -68,13 +63,12 @@ class AutomationTarget:
     capability: str | None = None
     policy_id: str | None = None
     agent_profile_id: str | None = None
-    # The kinds this target runs. None is absent from the entry, which keeps
-    # the original behavior: prompts only. An empty tuple runs none.
+    # The kinds this target runs. None means the entry omitted ``kinds`` or set
+    # it to null, and runs prompts only. An empty tuple runs none.
     kinds: tuple[AutomationKind, ...] | None = None
 
     @property
     def allowed_kinds(self) -> tuple[AutomationKind, ...]:
-        """The kinds this target runs; an entry without ``kinds`` runs prompts."""
         return self.kinds if self.kinds is not None else ("prompt",)
 
     def public(self) -> dict[str, Any]:
@@ -202,10 +196,10 @@ def classify_automation(
     """The automation's kind, decided here and nowhere else.
 
     ``prompt`` and ``plugin`` presets record ``preset_type``; a plugin-backed
-    automation carries ``plugin_spec``. The two tarball kinds share the raw
-    create path and differ in provenance: a ``script`` is a bundle an extension
-    entry shipped, recorded with the ``template`` it came from, while a
-    ``custom_tarball`` is an upload that names no template.
+    automation carries ``plugin_spec``. A ``script`` has template provenance: a
+    tarball, an entrypoint and the ``template`` it was created with. Every other
+    row falls through to ``custom_tarball``, including an upload with no
+    template, a row with no tarball, and an external URL.
     """
     preset = preset_metadata or {}
     preset_type = preset.get("preset_type")
@@ -250,12 +244,13 @@ def validate_target_selection(
         )
     allowed = target.allowed_kinds
     if kind not in allowed:
+        runs = ", ".join(allowed) if allowed else "none"
         raise target_field_error(
             field,
             CODE_TARGET_KIND_UNSUPPORTED,
             (
                 f"Target {target.name!r} does not run {kind!r} automations; "
-                f"it runs {', '.join(allowed)}."
+                f"it runs {runs}."
             ),
         )
     return target

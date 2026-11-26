@@ -88,10 +88,7 @@ from openhands.automation.schemas import (
     reject_public_draft_state,
 )
 from openhands.automation.storage import FileStore, ObjectNotFoundError, get_file_store
-from openhands.automation.targets import (
-    classify_automation,
-    validate_target_selection,
-)
+from openhands.automation.targets import validate_target_selection
 from openhands.automation.telemetry import (
     automation_created_event,
     automation_created_properties,
@@ -228,8 +225,8 @@ class CreatePromptAutomationRequest(BaseModel):
         max_length=64,
         description=(
             "Execution target (AUTOMATION_TARGETS id) this automation runs on. "
-            "Null selects the deployment default. Only a kind the target "
-            "allows may name it."
+            "Null selects the deployment default. The automation's kind must "
+            "be one the target allows."
         ),
     )
 
@@ -703,11 +700,7 @@ async def create_automation_from_prompt(
     6. Report completion status back to the automation service
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
-    # The prompt preset is a prompt-kind automation.
-    validate_target_selection(
-        body.target_id,
-        kind=classify_automation({"preset_type": "prompt"}, None, None, None),
-    )
+    validate_target_selection(body.target_id, kind="prompt")
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
         session, user.org_id, body.factory_id, body.outcome_parsers
@@ -914,8 +907,8 @@ class CreatePluginAutomationRequest(BaseModel):
         max_length=64,
         description=(
             "Execution target (AUTOMATION_TARGETS id) this automation runs on. "
-            "Null selects the deployment default. Only a kind the target "
-            "allows may name it."
+            "Null selects the deployment default. The automation's kind must "
+            "be one the target allows."
         ),
     )
 
@@ -1277,11 +1270,7 @@ async def create_automation_from_plugin(
     - With repo_path: subdirectory for monorepos
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
-    # The plugin preset is a plugin-kind automation.
-    validate_target_selection(
-        body.target_id,
-        kind=classify_automation({"preset_type": "plugin"}, None, None, None),
-    )
+    validate_target_selection(body.target_id, kind="plugin")
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
         session, user.org_id, body.factory_id, body.outcome_parsers

@@ -278,7 +278,6 @@ async def create_automation(
     ``run_as_user_id`` creates it as a service account of the org (managers only).
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
-    # A governed target runs only the kinds its registry entry allows.
     preset_metadata: dict[str, Any] | None = (
         {"template": body.template.model_dump(exclude_none=True)}
         if body.template is not None

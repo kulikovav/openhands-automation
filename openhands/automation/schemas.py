@@ -620,8 +620,8 @@ class CreateAutomationRequest(BaseModel):
         max_length=64,
         description=(
             "Execution target (AUTOMATION_TARGETS id) this automation runs on. "
-            "Null selects the deployment default. Only a kind the target "
-            "allows may name it."
+            "Null selects the deployment default. The automation's kind must "
+            "be one the target allows."
         ),
     )
 
@@ -1777,8 +1777,8 @@ class TargetCapability(_SetupContractModel):
     kinds: list[AutomationKind] = Field(
         ...,
         description=(
-            "Automation kinds this target runs. An entry without 'kinds' "
-            "reports ['prompt'], the original behavior."
+            "Automation kinds this target runs. Defaults to ``['prompt']`` "
+            "when the registry entry omits ``kinds``."
         ),
     )
 

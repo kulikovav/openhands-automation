@@ -89,10 +89,9 @@ SECRETS_TIMEOUT_SECONDS: Final[float] = 30.0
 # server that advertises this.
 SERVER_INFO_PATH: Final[str] = "/server_info"
 REPOSITORIES_CAPABILITY: Final[str] = "conversation_repositories_v1"
-# A script bundle is only started on a server that can unpack and run it.
+# A server without this capability would run the task without the script.
 BUNDLE_CAPABILITY: Final[str] = "automation_bundle_v1"
-# A plugin automation's sources and its config are only sent to a server that
-# loads them. A server without it would run the task without the plugin.
+# A server without this capability would run the task without the plugin.
 PLUGINS_CAPABILITY: Final[str] = "conversation_plugins_v1"
 
 _RUNTIME_MISSING_STATUSES: Final[frozenset[str]] = frozenset(

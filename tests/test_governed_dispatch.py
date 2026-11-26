@@ -561,7 +561,7 @@ class TestConfiguredSecretsAndRepositories:
         assert "repositories" not in payload
 
 
-BUNDLE_BYTES = b"not-a-real-tarball: qa-bundle-marker"
+BUNDLE_BYTES = b"not-a-real-tarball"
 
 
 class TestGovernedBundles:
@@ -763,7 +763,7 @@ class TestGovernedPlugins:
             "plugin": {"source": "github:owner/automation", "ref": "abc"},
             "config": {"mode": "fast"},
             "required_plugins": [
-                {"source": "github:owner/required", "resolved_ref": "deadbeef"}
+                {"source": "github:owner/required", "ref": "deadbeef"}
             ],
         }
         run = await make_run(
@@ -784,7 +784,7 @@ class TestGovernedPlugins:
                 "ref": "abc",
                 "config": {"mode": "fast"},
             },
-            {"source": "github:owner/required"},
+            {"source": "github:owner/required", "ref": "deadbeef"},
         ]
 
     async def test_plugin_variants_are_refused_before_the_claim(

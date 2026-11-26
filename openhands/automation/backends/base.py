@@ -34,7 +34,7 @@ class ExecutionContext:
 
 @dataclass(frozen=True)
 class AutomationBundle:
-    """A script bundle a governed start carries into its sandbox.
+    """A bundle a governed start carries into its sandbox.
 
     ``tarball`` is the archive itself. It must never be logged or named in an
     error message; only its length may appear there.
@@ -63,8 +63,8 @@ class ConversationStart:
     # ``{"repository", "git_provider", "branch"}``. It then runs their setup and
     # loads their skills and instruction files, as for a chat.
     repositories: list[dict[str, Any]] = field(default_factory=list)
-    # A governed target receives the run's script bundle here: the archive,
-    # its entrypoint and setup script, and the config rendered at creation.
+    # A governed target receives the run's bundle here: the archive, its
+    # entrypoint and setup script, and the template config it was created with.
     bundle: AutomationBundle | None = None
 
 

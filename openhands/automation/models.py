@@ -172,9 +172,9 @@ class Automation(Base):
     agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
 
     # Execution target this automation runs on (AUTOMATION_TARGETS id). NULL
-    # selects the deployment default backend. Only a kind the target's
-    # ``kinds`` entry allows may name it. Resolved at dispatch; runs snapshot it
-    # at creation.
+    # selects the deployment default backend. The automation's kind must be one
+    # the target's ``kinds`` entry allows. Resolved at dispatch; runs snapshot
+    # it at creation.
     target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Executable plugin-backed automation spec. When set, the dispatcher fetches

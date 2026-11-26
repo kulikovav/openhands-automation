@@ -298,8 +298,9 @@ def _conversation_start(
         if kind == "plugin":
             preset_plugins = (automation.preset_metadata or {}).get("plugins") or []
             if not preset_plugins:
-                # An A/B experiment: the runner picks the variant's plugins and
-                # model itself, so only it can create that conversation.
+                # A plugin preset with no stored plugins is an A/B experiment:
+                # the runner picks the variant's plugins and model itself, so
+                # only it can create that conversation.
                 return None
         # The presets require the finish tool; the app server's start request
         # takes that requirement as a plugin (see utils/finish_plugin.py).
@@ -1802,11 +1803,14 @@ async def _execute_run(
 def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
     """The plugin sources and config a governed conversation loads.
 
-    A plugin preset stores its sources in ``preset_metadata['plugins']``. An
-    A/B experiment deliberately stores none, because only the stock runner can
+    Each source keeps only ``source``, ``ref`` and ``repo_path``. A plugin
+    preset stores its sources in ``preset_metadata['plugins']``. An A/B
+    experiment deliberately stores none, because only the stock runner can
     pick a variant; the caller refuses that run. A plugin-spec automation
-    stores the executable plugin and any pinned required plugins, and its
-    validated config belongs to the executable one.
+    stores the executable plugin and its pinned required plugins, and its
+    validated config belongs to the executable one. The governed path does not
+    fetch the plugin manifest, so a plugin the manifest requires at run time
+    is not sent.
     """
     spec = automation.plugin_spec
     if spec is not None:
@@ -1824,10 +1828,11 @@ def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
 
 
 def _governed_bundle_config(automation: Automation) -> dict[str, Any]:
-    """The config a script bundle was created with, or an empty one.
+    """The config a bundle was created with, or an empty one.
 
-    The host that packed a bundle rendered its entry's config into the
-    ``template`` provenance, which is the only copy the service keeps.
+    It is the template config the automation was created with: the
+    client-supplied setup-form values, stored verbatim in the ``template``
+    provenance.
     """
     template = (automation.preset_metadata or {}).get("template")
     config = template.get("config") if isinstance(template, dict) else None
