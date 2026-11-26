@@ -45,6 +45,7 @@ from openhands.automation.providers import (
     verifier_schemes,
 )
 from openhands.automation.tags import normalize_tags
+from openhands.automation.targets import AutomationKind
 from openhands.automation.utils.cron import (
     validate_cron_schedule as validate_cron_schedule_value,
     validate_timezone_name,
@@ -619,8 +620,8 @@ class CreateAutomationRequest(BaseModel):
         max_length=64,
         description=(
             "Execution target (AUTOMATION_TARGETS id) this automation runs on. "
-            "Null selects the deployment default. Only prompt-preset automations "
-            "may name a target."
+            "Null selects the deployment default. Only a kind the target "
+            "allows may name it."
         ),
     )
 
@@ -1773,6 +1774,13 @@ class TargetCapability(_SetupContractModel):
     id: str = Field(..., description="AUTOMATION_TARGETS entry id")
     name: str = Field(..., description="Display name of the target")
     origin: str = Field(..., description="Origin of the target's Agent Server")
+    kinds: list[AutomationKind] = Field(
+        ...,
+        description=(
+            "Automation kinds this target runs. An entry without 'kinds' "
+            "reports ['prompt'], the original behavior."
+        ),
+    )
 
 
 class CapabilitiesResponse(_SetupContractModel):

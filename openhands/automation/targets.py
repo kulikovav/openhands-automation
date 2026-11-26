@@ -13,11 +13,21 @@ import json
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Final
+from typing import Any, Final, Literal
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 
+
+# The four creation paths an automation can have. One union names a kind, and
+# ``classify_automation`` is the only place that decides one.
+AutomationKind = Literal["prompt", "script", "plugin", "custom_tarball"]
+AUTOMATION_KINDS: Final[tuple[AutomationKind, ...]] = (
+    "prompt",
+    "script",
+    "plugin",
+    "custom_tarball",
+)
 
 # Exactly these keys are allowed on an entry; anything else is a startup error.
 TARGET_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
@@ -30,6 +40,7 @@ TARGET_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
         "capability",
         "policy_id",
         "agent_profile_id",
+        "kinds",
     }
 )
 _REQUIRED_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
@@ -38,7 +49,7 @@ _REQUIRED_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
 
 TARGET_FIELD: Final[str] = "target_id"
 CODE_TARGET_UNAVAILABLE: Final[str] = "target_unavailable"
-CODE_TARGET_REQUIRES_PROMPT_PRESET: Final[str] = "target_requires_prompt_preset"
+CODE_TARGET_KIND_UNSUPPORTED: Final[str] = "target_kind_unsupported"
 
 
 class TargetConfigError(ValueError):
@@ -57,10 +68,23 @@ class AutomationTarget:
     capability: str | None = None
     policy_id: str | None = None
     agent_profile_id: str | None = None
+    # The kinds this target runs. None is absent from the entry, which keeps
+    # the original behavior: prompts only. An empty tuple runs none.
+    kinds: tuple[AutomationKind, ...] | None = None
 
-    def public(self) -> dict[str, str]:
+    @property
+    def allowed_kinds(self) -> tuple[AutomationKind, ...]:
+        """The kinds this target runs; an entry without ``kinds`` runs prompts."""
+        return self.kinds if self.kinds is not None else ("prompt",)
+
+    def public(self) -> dict[str, Any]:
         """The capability-report view: no secret and no URL beyond the origin."""
-        return {"id": self.id, "name": self.name, "origin": self.origin}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "origin": self.origin,
+            "kinds": list(self.allowed_kinds),
+        }
 
 
 def _origin_of(url: str) -> str:
@@ -120,6 +144,16 @@ def parse_targets(raw: str) -> dict[str, AutomationTarget]:
         capability = entry.get("capability")
         if capability is not None and not isinstance(capability, str):
             raise TargetConfigError(f"{where}: capability must be a string")
+        kinds = entry.get("kinds")
+        if kinds is not None:
+            if not isinstance(kinds, list) or any(
+                not isinstance(kind, str) or kind not in AUTOMATION_KINDS
+                for kind in kinds
+            ):
+                raise TargetConfigError(
+                    f"{where}: kinds must be a list of {list(AUTOMATION_KINDS)}"
+                )
+            kinds = tuple(dict.fromkeys(kinds))
         targets[target_id] = AutomationTarget(
             id=target_id,
             name=entry["name"].strip(),
@@ -129,6 +163,7 @@ def parse_targets(raw: str) -> dict[str, AutomationTarget]:
             capability=capability,
             policy_id=entry.get("policy_id"),
             agent_profile_id=agent_profile_id,
+            kinds=kinds,
         )
     return targets
 
@@ -158,14 +193,29 @@ def target_name_of(target_id: str | None) -> str | None:
     return target.name if target else None
 
 
-def is_prompt_preset_automation(
+def classify_automation(
     preset_metadata: dict[str, Any] | None,
     plugin_spec: dict[str, Any] | None,
-) -> bool:
-    """Whether the automation is the prompt preset, the only supported kind."""
-    return plugin_spec is None and (preset_metadata or {}).get("preset_type") == (
-        "prompt"
-    )
+    tarball_path: str | None,
+    entrypoint: str | None,
+) -> AutomationKind:
+    """The automation's kind, decided here and nowhere else.
+
+    ``prompt`` and ``plugin`` presets record ``preset_type``; a plugin-backed
+    automation carries ``plugin_spec``. The two tarball kinds share the raw
+    create path and differ in provenance: a ``script`` is a bundle an extension
+    entry shipped, recorded with the ``template`` it came from, while a
+    ``custom_tarball`` is an upload that names no template.
+    """
+    preset = preset_metadata or {}
+    preset_type = preset.get("preset_type")
+    if plugin_spec is not None or preset_type in ("plugin", "plugin_spec"):
+        return "plugin"
+    if preset_type == "prompt":
+        return "prompt"
+    if tarball_path and entrypoint and preset.get("template"):
+        return "script"
+    return "custom_tarball"
 
 
 def target_field_error(field: str, code: str, message: str) -> HTTPException:
@@ -179,16 +229,15 @@ def target_field_error(field: str, code: str, message: str) -> HTTPException:
 def validate_target_selection(
     target_id: str | None,
     *,
-    preset_metadata: dict[str, Any] | None,
-    plugin_spec: dict[str, Any] | None,
+    kind: AutomationKind,
     field: str = TARGET_FIELD,
 ) -> AutomationTarget | None:
     """Validate one target selection at create, update, enable and dispatch.
 
     A null target selects the deployment default and is always valid. A
-    configured target must exist and the automation must be the prompt preset:
-    script, plugin and custom-tarball automations never run on a target, and
-    there is no fallback to the default backend.
+    configured target must exist and allow the automation's kind, as
+    ``classify_automation`` decided it. There is no fallback to the default
+    backend.
     """
     if not target_id:
         return None
@@ -199,13 +248,14 @@ def validate_target_selection(
             CODE_TARGET_UNAVAILABLE,
             f"No execution target named {target_id!r} is configured.",
         )
-    if not is_prompt_preset_automation(preset_metadata, plugin_spec):
+    allowed = target.allowed_kinds
+    if kind not in allowed:
         raise target_field_error(
             field,
-            CODE_TARGET_REQUIRES_PROMPT_PRESET,
+            CODE_TARGET_KIND_UNSUPPORTED,
             (
-                f"Target {target.name!r} runs only prompt-preset automations; "
-                "script, plugin and custom-tarball automations are refused."
+                f"Target {target.name!r} does not run {kind!r} automations; "
+                f"it runs {', '.join(allowed)}."
             ),
         )
     return target

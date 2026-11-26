@@ -10,12 +10,13 @@ Scheduled and event-driven automation execution for OpenHands Cloud. This servic
 - **Event-Driven**: Trigger automations via webhooks (e.g., GitHub events)
 - **API Key Management**: Per-user API keys for secure automation access
 - **Run History**: Track automation runs with status and results
-- **Governed Targets**: Dispatch prompt-preset automations as one Agent Server
-  conversation on a configured execution target (`AUTOMATION_TARGETS`), instead
-  of the bash entrypoint. Each entry allows exactly the keys `id`, `name`,
-  `url`, `api_key`, `origin` (defaults to the URL origin), `capability`,
-  `policy_id` and `agent_profile_id`; unknown keys fail startup. Unset or
-  empty means no targets and legacy behavior.
+- **Governed Targets**: Dispatch prompt, script, plugin and custom-tarball
+  automations as one Agent Server conversation on a configured execution target
+  (`AUTOMATION_TARGETS`), instead of the bash entrypoint. Each entry allows
+  exactly the keys `id`, `name`, `url`, `api_key`, `origin` (defaults to the URL
+  origin), `capability`, `policy_id`, `agent_profile_id` and `kinds` (defaults to
+  `["prompt"]`); unknown keys fail startup. Unset or empty means no targets and
+  legacy behavior.
 
 For a direct callback example, see [Teams outgoing webhooks](docs/teams-webhooks.md),
 including source admission, API setup and acknowledgement behavior.

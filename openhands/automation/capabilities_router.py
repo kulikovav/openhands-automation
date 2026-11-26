@@ -177,7 +177,13 @@ async def get_capabilities(
         ),
         features=sorted(features),
         targets=[
-            TargetCapability(id=t.id, name=t.name, origin=t.origin) for t in targets
+            TargetCapability(
+                id=t.id,
+                name=t.name,
+                origin=t.origin,
+                kinds=list(t.allowed_kinds),
+            )
+            for t in targets
         ],
         # The SDK packaged into a run decides which providers' tokens it can
         # clone with, so a setup form can offer exactly those repositories.

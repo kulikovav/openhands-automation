@@ -107,6 +107,7 @@ from openhands.automation.schemas import (
 from openhands.automation.storage import FileStore, get_file_store
 from openhands.automation.tags import normalize_tag
 from openhands.automation.targets import (
+    classify_automation,
     validate_target_selection,
 )
 from openhands.automation.telemetry import (
@@ -277,12 +278,17 @@ async def create_automation(
     ``run_as_user_id`` creates it as a service account of the org (managers only).
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
-    # A governed target refuses script and custom-tarball automations; only
-    # the prompt preset (the preset endpoints) may name a target.
+    # A governed target runs only the kinds its registry entry allows.
+    preset_metadata: dict[str, Any] | None = (
+        {"template": body.template.model_dump(exclude_none=True)}
+        if body.template is not None
+        else None
+    )
     validate_target_selection(
         body.target_id,
-        preset_metadata=None,
-        plugin_spec=None,
+        kind=classify_automation(
+            preset_metadata, None, body.tarball_path, body.entrypoint
+        ),
     )
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
@@ -322,10 +328,6 @@ async def create_automation(
         if body.agent_profile_id
         else resolve_model_profile_for_user(body.model, user)
     )
-
-    preset_metadata: dict[str, Any] | None = None
-    if body.template is not None:
-        preset_metadata = {"template": body.template.model_dump(exclude_none=True)}
 
     state = model_automation_state(body.state, body.enabled)
 
@@ -1007,8 +1009,12 @@ async def update_automation(
     if resulting_target_id or "target_id" in update_data:
         validate_target_selection(
             resulting_target_id,
-            preset_metadata=auto.preset_metadata,
-            plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+            kind=classify_automation(
+                auto.preset_metadata,
+                update_data.get("plugin_spec", auto.plugin_spec),
+                update_data.get("tarball_path", auto.tarball_path),
+                update_data.get("entrypoint", auto.entrypoint),
+            ),
         )
     # Same ownership check as create. Only a new value is checked: resending the
     # stored path cannot grant anything the row does not already have, and that
@@ -1715,8 +1721,12 @@ async def dispatch_automation(
     # letting the run fail in the background.
     validate_target_selection(
         auto.target_id,
-        preset_metadata=auto.preset_metadata,
-        plugin_spec=auto.plugin_spec,
+        kind=classify_automation(
+            auto.preset_metadata,
+            auto.plugin_spec,
+            auto.tarball_path,
+            auto.entrypoint,
+        ),
     )
     # One in-flight manual run per automation and target, refused the same way
     # every other live-run conflict is (409).
