@@ -83,9 +83,20 @@ def test_upgrade_from_the_pre_136_fork_keeps_existing_columns(tmp_path):
 
     _alembic(db_url, "upgrade", "head")
 
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    automation_columns = {c["name"] for c in inspector.get_columns("automations")}
+    factory_columns = {c["name"] for c in inspector.get_columns("factories")}
+    tables = set(inspector.get_table_names())
+    engine.dispose()
+
+    assert automation_columns >= {"target_id", "retain_transcript", "outcome_parsers"}
+    assert "outcome_keys" in factory_columns
+    assert "automation_outcome_values" in tables
+
     with sqlite3.connect(tmp_path / "legacy-fork.db") as con:
         version = con.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert version == ("045",)
+    assert version == ("046",)
 
 
 def test_downgrade_removes_target_columns(tmp_path):
