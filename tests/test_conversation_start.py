@@ -530,6 +530,8 @@ def _automation(**overrides: Any) -> Automation:
         "name": "Nightly",
         "preset_metadata": {"preset_type": "prompt", "prompt": "hi"},
         "plugin_spec": None,
+        "tarball_path": "https://example.com/a.tar.gz",
+        "entrypoint": "python main.py",
         "agent_profile_id": uuid.UUID(PROFILE_ID),
         "model": "Default",
     }

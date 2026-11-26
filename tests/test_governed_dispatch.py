@@ -1,9 +1,12 @@
 """Governed dispatch: one conversation per run, reconciled by identity."""
 
+import base64
 import json
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any
+from unittest.mock import MagicMock
 from urllib.parse import urlsplit
 
 import httpx
@@ -27,8 +30,11 @@ from openhands.automation.models import (
     Automation,
     AutomationRun,
     AutomationRunStatus,
+    TarballUpload,
+    UploadStatus,
 )
 from openhands.automation.targets import resolve_target
+from openhands.automation.utils.tarball_validation import build_internal_url
 from openhands.automation.utils.time import utcnow
 from openhands.automation.watchdog import reconcile_governed_runs
 
@@ -65,6 +71,32 @@ def targets_env(monkeypatch):
     clear_config_cache()
     yield
     clear_config_cache()
+
+
+@pytest.fixture
+def tarball_store(monkeypatch):
+    """The file store the dispatcher reads an internal upload from."""
+    store = MagicMock()
+    monkeypatch.setattr("openhands.automation.storage.get_file_store", lambda: store)
+    return store
+
+
+async def store_upload(session_factory, data: bytes) -> str:
+    """Record one completed internal upload and return its tarball_path."""
+    upload_id = uuid.uuid4()
+    async with session_factory() as session:
+        session.add(
+            TarballUpload(
+                id=upload_id,
+                user_id=TEST_USER_ID,
+                org_id=TEST_ORG_ID,
+                name="bundle",
+                status=UploadStatus.COMPLETED,
+                storage_path=f"uploads/{upload_id}.tar.gz",
+            )
+        )
+        await session.commit()
+    return build_internal_url(upload_id)
 
 
 class FakeGovernedServer:
@@ -183,22 +215,32 @@ async def make_run(
     retain_transcript: bool = True,
     timeout_at=None,
     repos: list[Any] | None = None,
+    preset_metadata: dict | None = _UNSET,
+    plugin_spec: dict | None = None,
+    tarball_path: str = "https://example.com/automation.tar.gz",
+    entrypoint: str = "python main.py",
+    setup_script_path: str | None = None,
 ):
     async with session_factory() as session:
-        preset_metadata: dict = {"preset_type": "prompt"}
-        if repos is not None:
-            preset_metadata["repos"] = repos
+        if preset_metadata is _UNSET:
+            metadata: dict | None = {"preset_type": "prompt"}
+            if repos is not None:
+                metadata["repos"] = repos
+        else:
+            metadata = preset_metadata
         automation = Automation(
             id=uuid.uuid4(),
             user_id=TEST_USER_ID,
             created_by_user_id=TEST_USER_ID,
             org_id=TEST_ORG_ID,
             name="Governed",
-            preset_metadata=preset_metadata,
+            preset_metadata=metadata,
+            plugin_spec=plugin_spec,
             prompt="Do the thing",
             trigger={"type": "cron", "schedule": "0 9 * * 1", "timezone": "UTC"},
-            tarball_path="https://example.com/automation.tar.gz",
-            entrypoint="python main.py",
+            tarball_path=tarball_path,
+            setup_script_path=setup_script_path,
+            entrypoint=entrypoint,
             target_id=target_id,
             retain_transcript=retain_transcript,
         )
@@ -517,6 +559,274 @@ class TestConfiguredSecretsAndRepositories:
         assert payload["conversation_id"] == governed_conversation_id_for(run.id)
         assert "secrets" not in payload
         assert "repositories" not in payload
+
+
+BUNDLE_BYTES = b"not-a-real-tarball: qa-bundle-marker"
+
+
+class TestGovernedBundles:
+    """Script and custom-tarball runs ride one bundle in the start payload."""
+
+    async def test_a_script_run_carries_one_bundle(
+        self, async_session_factory, targets_env, tarball_store
+    ):
+        tarball_store.read.return_value = BUNDLE_BYTES
+        tarball_path = await store_upload(async_session_factory, BUNDLE_BYTES)
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={
+                "template": {
+                    "id": "github-pr-reviewer",
+                    "version": "1.0.0",
+                    "config": {"label": "nightly"},
+                }
+            },
+            tarball_path=tarball_path,
+            entrypoint="python3 main.py",
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["automation_bundle_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["bundle"] == {
+            "entrypoint": "python3 main.py",
+            "setup_script_path": None,
+            "config": {"label": "nightly"},
+            "tarball_b64": base64.b64encode(BUNDLE_BYTES).decode("ascii"),
+        }
+        assert "plugins" not in payload
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.conversation_id == governed_conversation_id_for(run.id)
+
+    async def test_a_custom_tarball_run_carries_one_bundle(
+        self, async_session_factory, targets_env, tarball_store
+    ):
+        tarball_store.read.return_value = BUNDLE_BYTES
+        tarball_path = await store_upload(async_session_factory, BUNDLE_BYTES)
+        run = await make_run(
+            async_session_factory,
+            preset_metadata=None,
+            tarball_path=tarball_path,
+            entrypoint="bash run.sh",
+            setup_script_path="setup.sh",
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["automation_bundle_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["bundle"] == {
+            "entrypoint": "bash run.sh",
+            "setup_script_path": "setup.sh",
+            "config": {},
+            "tarball_b64": base64.b64encode(BUNDLE_BYTES).decode("ascii"),
+        }
+
+    async def test_a_target_without_the_bundle_capability_fails_closed(
+        self, async_session_factory, targets_env, tarball_store
+    ):
+        tarball_store.read.return_value = BUNDLE_BYTES
+        tarball_path = await store_upload(async_session_factory, BUNDLE_BYTES)
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path=tarball_path,
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = []
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "bundle_unsupported"
+        assert stored.status_detail["transient"] is False
+        assert server.posts("/api/conversations") == 0
+
+    async def test_a_url_tarball_is_refused_before_the_claim(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path="https://example.com/bundle.tar.gz",
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["automation_bundle_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "bundle_source_unsupported"
+        assert stored.execution_claim is None
+        assert server.posts("/api/conversations") == 0
+
+    async def test_a_missing_upload_fails_before_the_claim(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path=build_internal_url(uuid.uuid4()),
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "TarballNotFoundError"
+        assert stored.execution_claim is None
+        assert server.posts("/api/conversations") == 0
+
+    async def test_bundle_bytes_never_reach_a_log_or_an_error(
+        self, async_session_factory, targets_env, tarball_store, caplog
+    ):
+        caplog.set_level(logging.INFO)
+        marker = "qa-bundle-bytes-must-not-leak"
+        data = b"not-a-tarball" + marker.encode()
+        tarball_store.read.return_value = data
+        tarball_path = await store_upload(async_session_factory, data)
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path=tarball_path,
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = []
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert marker not in caplog.text
+        assert marker not in (stored.error_detail or "")
+        assert marker not in json.dumps(stored.status_detail or {})
+
+    async def test_a_duplicate_dispatch_does_not_reprepare_the_bundle(
+        self, async_session_factory, targets_env, tarball_store
+    ):
+        tarball_store.read.return_value = BUNDLE_BYTES
+        tarball_path = await store_upload(async_session_factory, BUNDLE_BYTES)
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path=tarball_path,
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["automation_bundle_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+            second = await reload_run(async_session_factory, run.id)
+            await dispatch(second, async_session_factory, client)
+
+        assert tarball_store.read.call_count == 1
+        assert len(server.payloads) == 1
+
+
+class TestGovernedPlugins:
+    """A plugin run carries its sources and config in the plugins field."""
+
+    async def test_a_plugin_preset_carries_its_sources(
+        self, async_session_factory, targets_env
+    ):
+        plugins = [{"source": "github:owner/repo", "ref": "v1"}]
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin", "plugins": plugins},
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["plugins"] == plugins
+        assert "bundle" not in payload
+
+    async def test_a_plugin_spec_carries_its_sources_and_config(
+        self, async_session_factory, targets_env
+    ):
+        plugin_spec = {
+            "plugin": {"source": "github:owner/automation", "ref": "abc"},
+            "config": {"mode": "fast"},
+            "required_plugins": [
+                {"source": "github:owner/required", "resolved_ref": "deadbeef"}
+            ],
+        }
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin_spec"},
+            plugin_spec=plugin_spec,
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["plugins"] == [
+            {
+                "source": "github:owner/automation",
+                "ref": "abc",
+                "config": {"mode": "fast"},
+            },
+            {"source": "github:owner/required"},
+        ]
+
+    async def test_plugin_variants_are_refused_before_the_claim(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin", "prompt": "hi"},
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "plugin_variants_unsupported"
+        assert stored.execution_claim is None
+        assert server.posts("/api/conversations") == 0
+
+    async def test_a_target_without_the_plugin_capability_fails_closed(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={
+                "preset_type": "plugin",
+                "plugins": [{"source": "github:owner/repo"}],
+            },
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = []
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "plugins_unsupported"
+        assert stored.status_detail["transient"] is False
+        assert server.posts("/api/conversations") == 0
 
 
 class TestReconcileByState:

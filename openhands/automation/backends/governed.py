@@ -1,8 +1,9 @@
 """Governed conversation execution for runs with an execution target.
 
 A run on a governed target is dispatched as one Agent Server conversation on
-the target's governed server. This backend never calls ``execute_in_context``,
-never uploads a tarball and never starts host bash. The conversation UUID is
+the target's governed server. This backend never calls ``execute_in_context``
+and never starts host bash. A script bundle rides the start payload for the
+sandbox to unpack and run; nothing here extracts it. The conversation UUID is
 derived deterministically from the run id and recorded in the run's execution
 claim before the start call, so a restart reuses the same identity and the
 target's ``idempotent_conversation_create_v1`` dedupes a repeat start.
@@ -18,6 +19,7 @@ target post terminal state to /v1/runs/{id}/complete.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import uuid
@@ -33,6 +35,7 @@ from sqlalchemy import inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openhands.automation.backends.base import (
+    ConversationStart,
     ExecutionBackend,
     ExecutionContext,
 )
@@ -86,6 +89,11 @@ SECRETS_TIMEOUT_SECONDS: Final[float] = 30.0
 # server that advertises this.
 SERVER_INFO_PATH: Final[str] = "/server_info"
 REPOSITORIES_CAPABILITY: Final[str] = "conversation_repositories_v1"
+# A script bundle is only started on a server that can unpack and run it.
+BUNDLE_CAPABILITY: Final[str] = "automation_bundle_v1"
+# A plugin automation's sources and its config are only sent to a server that
+# loads them. A server without it would run the task without the plugin.
+PLUGINS_CAPABILITY: Final[str] = "conversation_plugins_v1"
 
 _RUNTIME_MISSING_STATUSES: Final[frozenset[str]] = frozenset(
     {"missing", "ownership_lost", "error"}
@@ -386,7 +394,7 @@ class GovernedConversationBackend(ExecutionBackend):
         return False
 
     def get_work_dir(self, run_id: str) -> str:  # noqa: ARG002
-        """"""  # No workspace: governed runs never extract a tarball.
+        """"""  # No host workspace: the target's sandbox unpacks the bundle.
         return ""
 
     async def get_execution_context(
@@ -413,7 +421,9 @@ class GovernedConversationBackend(ExecutionBackend):
         client: httpx.AsyncClient,  # noqa: ARG002
         names: Collection[str],  # noqa: ARG002
     ) -> PluginSourceSecrets:
-        raise PluginSpecError("Governed runs take no plugin sources")
+        raise PluginSpecError(
+            "A governed run's plugin sources are fetched by its target"
+        )
 
     def build_env_vars(self) -> dict[str, str]:
         # No bash chain exists on a governed run.
@@ -495,12 +505,18 @@ class GovernedConversationBackend(ExecutionBackend):
         automation: Automation,
         run: AutomationRun,
         claim: ExecutionClaim,
+        start: ConversationStart,
     ) -> StartOutcome:
         """Start the run's conversation once, by its intended UUID.
 
         The governed server advertises ``idempotent_conversation_create_v1``:
         a repeat start with the same ``conversation_id`` answers 200 and does
         not resend the task. 201 and 200 are both a confirmed start.
+
+        ``start`` carries the run's plugins, or the script bundle the sandbox
+        unpacks. Each is sent only to a server that advertises it; a target
+        without the capability fails the run rather than running it without
+        the plugin or the script.
         """
         target = self._require_target()
         preset = automation.preset_metadata or {}
@@ -531,14 +547,37 @@ class GovernedConversationBackend(ExecutionBackend):
                     code="repositories_unsupported",
                 )
             payload["repositories"] = repositories
+        if start.plugins:
+            if not await self._advertises(client, PLUGINS_CAPABILITY):
+                return StartOutcome(
+                    error=(
+                        "Target cannot load the run's plugins: it does not "
+                        f"advertise {PLUGINS_CAPABILITY}"
+                    ),
+                    code="plugins_unsupported",
+                )
+            payload["plugins"] = start.plugins
+        if start.bundle is not None:
+            if not await self._advertises(client, BUNDLE_CAPABILITY):
+                return StartOutcome(
+                    error=(
+                        "Target cannot run the run's script bundle: it does "
+                        f"not advertise {BUNDLE_CAPABILITY}"
+                    ),
+                    code="bundle_unsupported",
+                )
+            payload["bundle"] = {
+                "entrypoint": start.bundle.entrypoint,
+                "setup_script_path": start.bundle.setup_script_path,
+                "config": start.bundle.config,
+                "tarball_b64": base64.b64encode(start.bundle.tarball).decode("ascii"),
+            }
         if target.agent_profile_id:
             payload["agent_profile_id"] = target.agent_profile_id
         # Only where the run already carries them: a plain prompt preset has
         # neither, and governed runs never get the finish-tool plugin.
         if preset.get("max_iterations") is not None:
             payload["max_iterations"] = preset["max_iterations"]
-        if preset.get("plugins"):
-            payload["plugins"] = preset["plugins"]
 
         try:
             response = await client.post(
