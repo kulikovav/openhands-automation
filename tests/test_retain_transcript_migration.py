@@ -1,4 +1,4 @@
-"""Migration 043: the per-automation governed transcript retention flag."""
+"""Migration 045: the per-automation governed transcript retention flag."""
 
 import os
 import sqlite3
@@ -64,7 +64,7 @@ def test_upgrade_adds_retention_on_an_empty_database(tmp_path):
 def test_downgrade_removes_retention(tmp_path):
     db_url = f"sqlite:///{tmp_path / 'down.db'}"
     _alembic(db_url, "upgrade", "head")
-    _alembic(db_url, "downgrade", "042")
+    _alembic(db_url, "downgrade", "044")
 
     engine = create_engine(db_url)
     inspector = inspect(engine)

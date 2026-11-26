@@ -1,7 +1,7 @@
 """Add automation execution targets.
 
-Revision ID: 042
-Revises: 041
+Revision ID: 044
+Revises: 043
 Create Date: 2026-11-23
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = "042"
-down_revision: str = "041"
+revision: str = "044"
+down_revision: str = "043"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -1,7 +1,7 @@
 """Keep a governed run's conversation and transcript after its sandbox stops.
 
-Revision ID: 043
-Revises: 042
+Revision ID: 045
+Revises: 044
 Create Date: 2026-11-24
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = "043"
-down_revision: str = "042"
+revision: str = "045"
+down_revision: str = "044"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

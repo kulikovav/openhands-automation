@@ -1,4 +1,4 @@
-"""Migration 042: automation targets and the run execution claim."""
+"""Migration 044: automation targets and the run execution claim."""
 
 import os
 import sqlite3
@@ -66,7 +66,7 @@ def test_upgrade_adds_target_columns_on_an_empty_database(tmp_path):
 def test_downgrade_removes_target_columns(tmp_path):
     db_url = f"sqlite:///{tmp_path / 'down.db'}"
     _alembic(db_url, "upgrade", "head")
-    _alembic(db_url, "downgrade", "041")
+    _alembic(db_url, "downgrade", "043")
 
     engine = create_engine(db_url)
     inspector = inspect(engine)
