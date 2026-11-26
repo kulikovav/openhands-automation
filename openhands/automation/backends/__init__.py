@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from openhands.automation.backends.base import (
+    AutomationBundle,
     ConversationStart,
     ExecutionBackend,
     ExecutionContext,
@@ -69,6 +70,7 @@ def get_backend(run: AutomationRun) -> ExecutionBackend:
 
 
 __all__ = [
+    "AutomationBundle",
     "ConversationStart",
     "ExecutionBackend",
     "ExecutionContext",

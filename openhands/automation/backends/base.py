@@ -32,6 +32,20 @@ class ExecutionContext:
     api_key: str | None = None
 
 
+@dataclass(frozen=True)
+class AutomationBundle:
+    """A script bundle a governed start carries into its sandbox.
+
+    ``tarball`` is the archive itself. It must never be logged or named in an
+    error message; only its length may appear there.
+    """
+
+    entrypoint: str
+    setup_script_path: str | None
+    config: dict[str, Any]
+    tarball: bytes
+
+
 @dataclass
 class ConversationStart:
     """What the profile owner needs to start a run's conversation in its sandbox.
@@ -49,6 +63,9 @@ class ConversationStart:
     # ``{"repository", "git_provider", "branch"}``. It then runs their setup and
     # loads their skills and instruction files, as for a chat.
     repositories: list[dict[str, Any]] = field(default_factory=list)
+    # A governed target receives the run's script bundle here: the archive,
+    # its entrypoint and setup script, and the config rendered at creation.
+    bundle: AutomationBundle | None = None
 
 
 @dataclass
