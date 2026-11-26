@@ -24,6 +24,11 @@ from fastapi import HTTPException, status
 AutomationKind = Literal["prompt", "script", "plugin", "custom_tarball"]
 AUTOMATION_KINDS: Final[tuple[AutomationKind, ...]] = get_args(AutomationKind)
 
+# The kinds the stock runner starts a conversation for; the rest ride a bundle
+# a governed target unpacks.
+STOCK_PRESET_KINDS: Final[tuple[AutomationKind, ...]] = ("prompt", "plugin")
+BUNDLE_KINDS: Final[tuple[AutomationKind, ...]] = ("script", "custom_tarball")
+
 # Exactly these keys are allowed on an entry; anything else is a startup error.
 TARGET_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -70,15 +75,6 @@ class AutomationTarget:
     @property
     def allowed_kinds(self) -> tuple[AutomationKind, ...]:
         return self.kinds if self.kinds is not None else ("prompt",)
-
-    def public(self) -> dict[str, Any]:
-        """The capability-report view: no secret and no URL beyond the origin."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "origin": self.origin,
-            "kinds": list(self.allowed_kinds),
-        }
 
 
 def _origin_of(url: str) -> str:
@@ -212,6 +208,22 @@ def classify_automation(
     return "custom_tarball"
 
 
+def plugin_preset_sources(
+    preset_metadata: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """The plugin sources a plugin preset stores.
+
+    A plugin A/B experiment stores none: only the stock runner can pick a
+    variant, so an empty list means an experiment, not a plugin-less preset.
+    """
+    return list((preset_metadata or {}).get("plugins") or [])
+
+
+def is_plugin_experiment(preset_metadata: dict[str, Any] | None) -> bool:
+    """Whether a plugin preset stores no sources, so only the stock runner runs it."""
+    return not plugin_preset_sources(preset_metadata)
+
+
 def target_field_error(field: str, code: str, message: str) -> HTTPException:
     """The 422 field error shape every target refusal uses."""
     return HTTPException(
@@ -220,18 +232,29 @@ def target_field_error(field: str, code: str, message: str) -> HTTPException:
     )
 
 
+def target_kind_error(target: AutomationTarget, kind: AutomationKind) -> str | None:
+    """Why ``target`` does not run ``kind`` automations, or None when it does."""
+    allowed = target.allowed_kinds
+    if kind in allowed:
+        return None
+    runs = ", ".join(allowed) if allowed else "none"
+    return f"Target {target.name!r} does not run {kind!r} automations; it runs {runs}."
+
+
 def validate_target_selection(
     target_id: str | None,
     *,
     kind: AutomationKind,
     field: str = TARGET_FIELD,
 ) -> AutomationTarget | None:
-    """Validate one target selection at create, update, enable and dispatch.
+    """Validate one target selection at create, update and run dispatch.
 
     A null target selects the deployment default and is always valid. A
     configured target must exist and allow the automation's kind, as
-    ``classify_automation`` decided it. There is no fallback to the default
-    backend.
+    ``classify_automation`` decided it. Dispatch repeats the kind check: a
+    target whose ``kinds`` shrank after the automation was stored refuses its
+    triggered runs too, not only a manual dispatch. There is no fallback to the
+    default backend.
     """
     if not target_id:
         return None
@@ -242,15 +265,7 @@ def validate_target_selection(
             CODE_TARGET_UNAVAILABLE,
             f"No execution target named {target_id!r} is configured.",
         )
-    allowed = target.allowed_kinds
-    if kind not in allowed:
-        runs = ", ".join(allowed) if allowed else "none"
-        raise target_field_error(
-            field,
-            CODE_TARGET_KIND_UNSUPPORTED,
-            (
-                f"Target {target.name!r} does not run {kind!r} automations; "
-                f"it runs {runs}."
-            ),
-        )
+    message = target_kind_error(target, kind)
+    if message is not None:
+        raise target_field_error(field, CODE_TARGET_KIND_UNSUPPORTED, message)
     return target

@@ -134,12 +134,6 @@ def test_unset_or_empty_targets_means_no_targets():
 def test_origin_defaults_to_the_url_origin():
     [target] = parse_targets(json.dumps([TARGET_ENTRY])).values()
     assert target.origin == "https://governed.example:8443"
-    assert target.public() == {
-        "id": TARGET_ID,
-        "name": TARGET_NAME,
-        "origin": "https://governed.example:8443",
-        "kinds": ["prompt"],
-    }
 
 
 def test_explicit_origin_is_kept():

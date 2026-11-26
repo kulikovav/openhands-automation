@@ -19,7 +19,6 @@ target post terminal state to /v1/runs/{id}/complete.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import uuid
@@ -341,6 +340,22 @@ class ConversationState:
     transient: bool = False
 
 
+@dataclass(frozen=True)
+class PreparedStart:
+    """The target-dependent start inputs, resolved before the run's claim."""
+
+    secrets: dict[str, Any]
+    repositories: list[dict[str, Any]]
+
+
+class TargetCapabilityError(RuntimeError):
+    """The target lacks a capability a start needs. Nothing was claimed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class TargetUnavailableError(RuntimeError):
     """The run's target is no longer configured."""
 
@@ -498,6 +513,50 @@ class GovernedConversationBackend(ExecutionBackend):
             return False
         return isinstance(capabilities, list) and capability in capabilities
 
+    async def prepare_start(
+        self,
+        client: httpx.AsyncClient,
+        automation: Automation,
+        start: ConversationStart,
+    ) -> PreparedStart:
+        """Resolve the read-only start inputs and refuse a missing capability.
+
+        ``/server_info`` and the target's secret list are read-only, so this
+        runs before the execution claim: a config mismatch fails the run
+        without leaving a claim for a conversation that never existed.
+        """
+        secrets = await self.configured_secrets(client)
+        repositories = _preclone_repositories(
+            (automation.preset_metadata or {}).get("repos"), secrets.keys()
+        )
+        if repositories and not await self._advertises(client, REPOSITORIES_CAPABILITY):
+            raise TargetCapabilityError(
+                "repositories_unsupported",
+                (
+                    "Target cannot clone the run's repositories: it does "
+                    f"not advertise {REPOSITORIES_CAPABILITY}"
+                ),
+            )
+        if start.plugins and not await self._advertises(client, PLUGINS_CAPABILITY):
+            raise TargetCapabilityError(
+                "plugins_unsupported",
+                (
+                    "Target cannot load the run's plugins: it does not "
+                    f"advertise {PLUGINS_CAPABILITY}"
+                ),
+            )
+        if start.bundle is not None and not await self._advertises(
+            client, BUNDLE_CAPABILITY
+        ):
+            raise TargetCapabilityError(
+                "bundle_unsupported",
+                (
+                    "Target cannot run the run's script bundle: it does "
+                    f"not advertise {BUNDLE_CAPABILITY}"
+                ),
+            )
+        return PreparedStart(secrets=secrets, repositories=repositories)
+
     async def start_conversation(
         self,
         client: httpx.AsyncClient,
@@ -505,6 +564,7 @@ class GovernedConversationBackend(ExecutionBackend):
         run: AutomationRun,
         claim: ExecutionClaim,
         start: ConversationStart,
+        prepared: PreparedStart,
     ) -> StartOutcome:
         """Start the run's conversation once, by its intended UUID.
 
@@ -512,10 +572,10 @@ class GovernedConversationBackend(ExecutionBackend):
         a repeat start with the same ``conversation_id`` answers 200 and does
         not resend the task. 201 and 200 are both a confirmed start.
 
-        ``start`` carries the run's plugins, or the script bundle the sandbox
-        unpacks. Each is sent only to a server that advertises it; a target
-        without the capability fails the run rather than running it without
-        the plugin or the script.
+        ``prepared`` carries the secrets, repositories and capability verdicts
+        resolved before the claim. ``start`` carries the run's plugins, or the
+        script bundle the sandbox unpacks; ``prepare_start`` already refused a
+        target that does not advertise what the start carries.
         """
         target = self._require_target()
         preset = automation.preset_metadata or {}
@@ -529,48 +589,15 @@ class GovernedConversationBackend(ExecutionBackend):
             },
         }
         # The configured secrets (by reference), and the repositories their
-        # provider tokens can clone. A server from before the clone field
-        # ignores it, so a run that names repositories is refused unless the
-        # target advertises that it clones them.
-        secrets = await self.configured_secrets(client)
-        if secrets:
-            payload["secrets"] = secrets
-        repositories = _preclone_repositories(preset.get("repos"), secrets.keys())
-        if repositories:
-            if not await self._advertises(client, REPOSITORIES_CAPABILITY):
-                return StartOutcome(
-                    error=(
-                        "Target cannot clone the run's repositories: it does "
-                        f"not advertise {REPOSITORIES_CAPABILITY}"
-                    ),
-                    code="repositories_unsupported",
-                )
-            payload["repositories"] = repositories
+        # provider tokens can clone.
+        if prepared.secrets:
+            payload["secrets"] = prepared.secrets
+        if prepared.repositories:
+            payload["repositories"] = prepared.repositories
         if start.plugins:
-            if not await self._advertises(client, PLUGINS_CAPABILITY):
-                return StartOutcome(
-                    error=(
-                        "Target cannot load the run's plugins: it does not "
-                        f"advertise {PLUGINS_CAPABILITY}"
-                    ),
-                    code="plugins_unsupported",
-                )
             payload["plugins"] = start.plugins
         if start.bundle is not None:
-            if not await self._advertises(client, BUNDLE_CAPABILITY):
-                return StartOutcome(
-                    error=(
-                        "Target cannot run the run's script bundle: it does "
-                        f"not advertise {BUNDLE_CAPABILITY}"
-                    ),
-                    code="bundle_unsupported",
-                )
-            payload["bundle"] = {
-                "entrypoint": start.bundle.entrypoint,
-                "setup_script_path": start.bundle.setup_script_path,
-                "config": start.bundle.config,
-                "tarball_b64": base64.b64encode(start.bundle.tarball).decode("ascii"),
-            }
+            payload["bundle"] = start.bundle.to_payload()
         if target.agent_profile_id:
             payload["agent_profile_id"] = target.agent_profile_id
         # Only where the run already carries them: a plain prompt preset has

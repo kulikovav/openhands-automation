@@ -1,8 +1,9 @@
 """Base classes for execution backends."""
 
+import base64
 from abc import ABC, abstractmethod
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -44,6 +45,17 @@ class AutomationBundle:
     setup_script_path: str | None
     config: dict[str, Any]
     tarball: bytes
+
+    def to_payload(self) -> dict[str, Any]:
+        """The start payload's ``bundle``: every field, with the archive encoded.
+
+        Built from the dataclass fields, so a new field cannot be dropped here.
+        """
+        payload = asdict(self)
+        payload["tarball_b64"] = base64.b64encode(payload.pop("tarball")).decode(
+            "ascii"
+        )
+        return payload
 
 
 @dataclass

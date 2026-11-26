@@ -162,6 +162,35 @@ class TestGetCapabilities:
         assert "pluginSpecAgentProfiles" in response.json()["features"]
         assert "presetAgentProfiles" in response.json()["features"]
 
+    async def test_configured_targets_are_reported_from_the_registry(
+        self, async_client, ready_deployment, monkeypatch
+    ):
+        """The live report is the registry view: no secret, no URL path."""
+        entry = {
+            "id": "governed-1",
+            "name": "Governed Sandbox",
+            "url": "https://governed.example:8443/api",
+            "api_key": "sk-target-secret-do-not-leak",
+            "agent_profile_id": str(uuid.uuid4()),
+            "kinds": ["prompt", "script"],
+        }
+        monkeypatch.setenv("AUTOMATION_TARGETS", json.dumps([entry]))
+        clear_config_cache()
+
+        response = await async_client.get(CAPABILITIES_URL)
+
+        body = response.json()
+        assert body["targets"] == [
+            {
+                "id": "governed-1",
+                "name": "Governed Sandbox",
+                "origin": "https://governed.example:8443",
+                "kinds": ["prompt", "script"],
+            }
+        ]
+        assert "governedTargets" in body["features"]
+        assert "sk-target-secret-do-not-leak" not in response.text
+
     async def test_configured_deployment_advertises_event_support(
         self, async_client, configured_deployment
     ):

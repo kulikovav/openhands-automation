@@ -1183,6 +1183,52 @@ def validate_required_plugins(
     return resolved
 
 
+def required_plugin_sources(
+    plugin_spec: dict[str, Any], manifest: AutomationPluginManifest
+) -> list[AutomationPluginSource]:
+    """The secondary plugins a run loads: the stored pins, else the manifest's.
+
+    A stored ``required_plugins`` list is authoritative, because it pins the
+    refs (automations that run as a service account); otherwise the manifest's
+    ``runtime.plugins`` decide.
+    """
+    stored_required = plugin_spec.get("required_plugins")
+    return (
+        [AutomationPluginSource.model_validate(item) for item in stored_required]
+        if stored_required is not None
+        else manifest.runtime.plugins
+    )
+
+
+async def resolve_plugin_spec(
+    plugin_spec: dict[str, Any],
+    *,
+    allow_local_sources: bool = True,
+    secrets: PluginSecretLookup = no_plugin_secrets,
+) -> tuple[
+    AutomationPluginSource, AutomationPluginManifest, str | None, list[dict[str, Any]]
+]:
+    """Resolve a plugin spec's executable source and the plugins it runs with.
+
+    For a governed run that only needs the sources, so they are the same
+    plugins a stock run resolves. ``secrets`` resolves the placeholders of
+    private sources.
+    """
+    source = AutomationPluginSource.model_validate(plugin_spec["plugin"])
+    resolved_ref, manifest = preflight_manifest(
+        source,
+        allow_local_sources=allow_local_sources,
+        secrets=await secrets(plugin_secret_names([source])),
+    )
+    required_sources = required_plugin_sources(plugin_spec, manifest)
+    required_plugins = validate_required_plugins(
+        required_sources,
+        allow_local_sources=allow_local_sources,
+        secrets=await secrets(plugin_secret_names(required_sources)),
+    )
+    return source, manifest, resolved_ref, required_plugins
+
+
 async def build_execution_payload(
     *,
     plugin_spec: dict[str, Any],
@@ -1206,14 +1252,7 @@ async def build_execution_payload(
         secrets=await secrets(plugin_secret_names([source])),
     )
     config = validate_plugin_config(manifest, requested_config)
-    # A stored list pins the secondary plugins (automations that run as a
-    # service account); otherwise they follow the manifest's refs.
-    stored_required = plugin_spec.get("required_plugins")
-    required_sources = (
-        [AutomationPluginSource.model_validate(item) for item in stored_required]
-        if stored_required is not None
-        else manifest.runtime.plugins
-    )
+    required_sources = required_plugin_sources(plugin_spec, manifest)
     required_plugins = validate_required_plugins(
         required_sources,
         allow_local_sources=allow_local_sources,

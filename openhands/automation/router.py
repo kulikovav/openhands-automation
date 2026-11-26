@@ -107,6 +107,7 @@ from openhands.automation.schemas import (
 from openhands.automation.storage import FileStore, get_file_store
 from openhands.automation.tags import normalize_tag
 from openhands.automation.targets import (
+    STOCK_PRESET_KINDS,
     classify_automation,
     validate_target_selection,
 )
@@ -983,8 +984,8 @@ async def update_automation(
                 update_data.get("outcome_parsers", auto.outcome_parsers),
             )
     # Target selection is validated on every update of a targeted automation
-    # and on every explicit target change: the target must still exist and the
-    # automation must be the prompt preset, exactly as at creation.
+    # and on every explicit target change: the target must still exist and
+    # allow the automation's kind, exactly as at creation.
     if "target_id" in update_data and update_data["target_id"] != auto.target_id:
         live_run = await session.scalar(
             select(AutomationRun.id)
@@ -1043,9 +1044,9 @@ async def update_automation(
     # records them in preset_metadata, so they are applied with the prompt below.
     repos_requested = "repos" in update_data
     update_data.pop("repos", None)
-    if repos_requested and (auto.preset_metadata or {}).get("preset_type") not in (
-        "prompt",
-        "plugin",
+    if (
+        repos_requested
+        and (auto.preset_metadata or {}).get("preset_type") not in STOCK_PRESET_KINDS
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,

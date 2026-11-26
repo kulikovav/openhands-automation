@@ -33,6 +33,7 @@ from openhands.automation.models import (
     TarballUpload,
     UploadStatus,
 )
+from openhands.automation.plugin_specs import PluginSpecError
 from openhands.automation.targets import resolve_target
 from openhands.automation.utils.tarball_validation import build_internal_url
 from openhands.automation.utils.time import utcnow
@@ -51,6 +52,9 @@ TARGET_ENTRY = {
     "url": TARGET_URL,
     "api_key": TARGET_SECRET,
     "agent_profile_id": PROFILE_ID,
+    # Every governed dispatch test exercises one kind or another; the kind
+    # gate itself is tested with an explicit prompt-only entry.
+    "kinds": ["prompt", "script", "plugin", "custom_tarball"],
 }
 
 # Distinguishes "no override" from a scripted ``null`` JSON body.
@@ -356,6 +360,31 @@ class TestDispatchOnce:
         assert stored.status_detail["code"] == "target_unavailable"
         assert server.requests == []
 
+    async def test_a_disallowed_kind_is_refused_at_dispatch_without_calls(
+        self, async_session_factory, targets_env, monkeypatch
+    ):
+        """A target that runs prompts only refuses a triggered script run."""
+        monkeypatch.setenv(
+            "AUTOMATION_TARGETS",
+            json.dumps([{**TARGET_ENTRY, "kinds": ["prompt"]}]),
+        )
+        clear_config_cache()
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"template": {"id": "bundle", "version": "1.0.0"}},
+            tarball_path="https://example.com/automation.tar.gz",
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "target_kind_unsupported"
+        assert stored.execution_claim is None
+        assert server.requests == []
+
 
 class TestConfiguredSecretsAndRepositories:
     """A governed start carries the target's secrets and its pre-clone repos."""
@@ -523,6 +552,7 @@ class TestConfiguredSecretsAndRepositories:
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail is not None
         assert stored.status_detail["code"] == "repositories_unsupported"
+        assert stored.execution_claim is None
         assert server.posts("/api/conversations") == 0
 
     async def test_a_null_secret_list_starts_the_run_without_secrets(
@@ -648,6 +678,7 @@ class TestGovernedBundles:
         assert stored.status_detail is not None
         assert stored.status_detail["code"] == "bundle_unsupported"
         assert stored.status_detail["transient"] is False
+        assert stored.execution_claim is None
         assert server.posts("/api/conversations") == 0
 
     async def test_a_url_tarball_is_refused_before_the_claim(
@@ -826,6 +857,67 @@ class TestGovernedPlugins:
         assert stored.status == AutomationRunStatus.FAILED
         assert stored.status_detail["code"] == "plugins_unsupported"
         assert stored.status_detail["transient"] is False
+        assert stored.execution_claim is None
+        assert server.posts("/api/conversations") == 0
+
+    async def test_a_plugin_spec_resolves_the_manifest_plugins(
+        self, async_session_factory, targets_env, monkeypatch
+    ):
+        """A spec without pinned plugins uses the stock manifest resolution."""
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin_spec"},
+            plugin_spec={"plugin": {"source": "github:owner/automation", "ref": "abc"}},
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+
+        async def fake_resolve(spec, **kwargs):  # noqa: ARG001
+            return (
+                None,
+                None,
+                "abc",
+                [{"source": "github:owner/required", "resolved_ref": "deadbeef"}],
+            )
+
+        monkeypatch.setattr(
+            "openhands.automation.dispatcher.resolve_plugin_spec", fake_resolve
+        )
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["plugins"] == [
+            {"source": "github:owner/automation", "ref": "abc"},
+            {"source": "github:owner/required", "ref": "deadbeef"},
+        ]
+
+    async def test_a_plugin_spec_that_cannot_resolve_its_plugins_fails_closed(
+        self, async_session_factory, targets_env, monkeypatch
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin_spec"},
+            plugin_spec={"plugin": {"source": "github:owner/automation", "ref": "abc"}},
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+
+        async def fail_resolve(spec, **kwargs):  # noqa: ARG001
+            raise PluginSpecError("manifest unreachable")
+
+        monkeypatch.setattr(
+            "openhands.automation.dispatcher.resolve_plugin_spec", fail_resolve
+        )
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail["code"] == "plugin_spec_unresolved"
+        assert stored.execution_claim is None
         assert server.posts("/api/conversations") == 0
 
 

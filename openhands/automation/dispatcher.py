@@ -41,6 +41,7 @@ from openhands.automation.backends import (
     get_backend,
 )
 from openhands.automation.backends.governed import (
+    TargetCapabilityError,
     claim_execution,
     governed_conversation_id_for,
     record_started_conversation,
@@ -78,13 +79,21 @@ from openhands.automation.plugin_specs import (
     PluginSpecError,
     build_execution_payload,
     plugin_secret_names,
+    resolve_plugin_spec,
 )
 from openhands.automation.preset_router import with_current_preset_runner
 from openhands.automation.subjects import conversation_id_for, service_account_id_of
 from openhands.automation.targets import (
+    BUNDLE_KINDS,
+    CODE_TARGET_KIND_UNSUPPORTED,
     CODE_TARGET_UNAVAILABLE,
+    STOCK_PRESET_KINDS,
+    AutomationKind,
     classify_automation,
+    is_plugin_experiment,
+    plugin_preset_sources,
     resolve_target,
+    target_kind_error,
 )
 from openhands.automation.telemetry import (
     capture_automation_event,
@@ -135,6 +144,7 @@ from openhands.automation.utils.timeout import resolve_automation_timeout_second
 from openhands.automation.utils.unhealthy import (
     maybe_disable_unhealthy_automation_after_run,
 )
+from openhands.sdk.plugin import PluginSourceError
 
 
 DISPATCH_RETRIES_KEY: Final[str] = "dispatch_retries"
@@ -243,6 +253,14 @@ def _api_key_error_message(exc: APIKeyError, what: str) -> str:
 _PLUGIN_SOURCE_KEYS = frozenset({"source", "ref", "repo_path"})
 
 
+def _plugin_payload_source(source: dict[str, Any]) -> dict[str, Any]:
+    """One plugin source as a start payload names it: a pinned ref, no extras."""
+    item = {key: value for key, value in source.items() if key in _PLUGIN_SOURCE_KEYS}
+    if resolved_ref := source.get("resolved_ref"):
+        item["ref"] = resolved_ref
+    return item
+
+
 def _conversation_tags(automation: Automation, run: AutomationRun) -> dict[str, str]:
     """The tags the stock runners put on their conversations."""
     return {
@@ -288,20 +306,17 @@ def _conversation_start(
         )
         # The agent profile owns the model for plugin-spec runs.
         llm_profile = None
-        plugins = [
-            {k: v for k, v in plugin.items() if k in _PLUGIN_SOURCE_KEYS}
-            for plugin in plugin_fetches
-        ]
+        plugins = [_plugin_payload_source(plugin) for plugin in plugin_fetches]
         repositories: list[dict[str, Any]] = []
-    elif kind in ("prompt", "plugin"):
+    elif kind in STOCK_PRESET_KINDS:
         preset_plugins: list[dict[str, Any]] = []
         if kind == "plugin":
-            preset_plugins = (automation.preset_metadata or {}).get("plugins") or []
-            if not preset_plugins:
+            if is_plugin_experiment(automation.preset_metadata):
                 # A plugin preset with no stored plugins is an A/B experiment:
                 # the runner picks the variant's plugins and model itself, so
                 # only it can create that conversation.
                 return None
+            preset_plugins = plugin_preset_sources(automation.preset_metadata)
         # The presets require the finish tool; the app server's start request
         # takes that requirement as a plugin (see utils/finish_plugin.py).
         plugins = [{"source": finish_plugin_dir(str(run.id))}, *preset_plugins]
@@ -1800,31 +1815,36 @@ async def _execute_run(
     )
 
 
-def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
+async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
     """The plugin sources and config a governed conversation loads.
 
     Each source keeps only ``source``, ``ref`` and ``repo_path``. A plugin
-    preset stores its sources in ``preset_metadata['plugins']``. An A/B
-    experiment deliberately stores none, because only the stock runner can
-    pick a variant; the caller refuses that run. A plugin-spec automation
-    stores the executable plugin and its pinned required plugins, and its
-    validated config belongs to the executable one. The governed path does not
-    fetch the plugin manifest, so a plugin the manifest requires at run time
-    is not sent.
+    preset stores its sources in ``preset_metadata['plugins']``; an A/B
+    experiment deliberately stores none, and the caller refuses that run. A
+    plugin-spec automation stores the executable plugin, its validated config,
+    and either the pinned required plugins or the refs its manifest names,
+    resolved exactly as a stock run resolves them.
     """
     spec = automation.plugin_spec
-    if spec is not None:
-        sources = [spec["plugin"], *(spec.get("required_plugins") or [])]
-        plugins = [
-            {key: value for key, value in source.items() if key in _PLUGIN_SOURCE_KEYS}
-            for source in sources
-        ]
-        config = spec.get("config") or {}
-        if config:
-            plugins[0] = {**plugins[0], "config": config}
-        return plugins
-    preset = automation.preset_metadata or {}
-    return list(preset.get("plugins") or [])
+    if spec is None:
+        return plugin_preset_sources(automation.preset_metadata)
+    stored_required = spec.get("required_plugins")
+    if stored_required is None:
+        try:
+            _, _, _, required = await resolve_plugin_spec(
+                spec, allow_local_sources=False
+            )
+        except (PluginSpecError, PluginSourceError) as exc:
+            raise PluginSpecError(
+                f"Could not resolve the plugin's run-time plugins: {exc}"
+            ) from exc
+    else:
+        required = stored_required
+    plugins = [_plugin_payload_source(source) for source in [spec["plugin"], *required]]
+    config = spec.get("config") or {}
+    if config:
+        plugins[0] = {**plugins[0], "config": config}
+    return plugins
 
 
 def _governed_bundle_config(automation: Automation) -> dict[str, Any]:
@@ -1841,6 +1861,7 @@ def _governed_bundle_config(automation: Automation) -> dict[str, Any]:
 
 async def _governed_conversation_start(
     automation: Automation,
+    kind: AutomationKind,
     session_factory: async_sessionmaker[AsyncSession],
     fail: Any,
     log_ctx: Any,
@@ -1850,17 +1871,28 @@ async def _governed_conversation_start(
     A script or custom-tarball run carries one bundle, read from the upload
     store and never extracted here. A plugin run carries its sources and
     config. A plugin A/B experiment is refused: only the stock runner can pick
-    a variant.
+    a variant. ``kind`` is classified once by the caller, which also checks it
+    against the target's allowed kinds.
     """
-    kind = classify_automation(
-        automation.preset_metadata,
-        automation.plugin_spec,
-        automation.tarball_path,
-        automation.entrypoint,
-    )
     start = ConversationStart()
     if kind == "plugin":
-        start.plugins = _governed_plugin_sources(automation)
+        try:
+            start.plugins = await _governed_plugin_sources(automation)
+        except PluginSpecError as exc:
+            error = str(exc)
+            await fail(
+                error,
+                status_detail=make_run_status_detail(
+                    phase=RunStatusPhase.DISPATCH,
+                    kind=RunStatusDetailKind.UNKNOWN,
+                    detail=error,
+                    transient=False,
+                    source="automation_service",
+                    operation="prepare_plugins",
+                    code="plugin_spec_unresolved",
+                ),
+            )
+            return None
         if not start.plugins:
             error = (
                 "A/B plugin variants run only on the stock runner; a governed "
@@ -1880,7 +1912,7 @@ async def _governed_conversation_start(
             )
             return None
         return start
-    if kind not in ("script", "custom_tarball"):
+    if kind not in BUNDLE_KINDS:
         return start
 
     upload_id = parse_internal_upload_id(automation.tarball_path)
@@ -1950,11 +1982,12 @@ async def _execute_governed_run(
 ) -> None:
     """Dispatch a governed run as one conversation on its execution target.
 
-    The bundle or plugin sources are prepared before the claim, so a missing
-    upload fails the run without leaving a claimed conversation. The execution
-    claim is committed before the start call, so a crash or restart reuses the
-    same conversation id and the target's idempotent create dedupes a repeat
-    start. A run with a claim is never requeued. The watchdog's
+    The target's kind gate, the bundle or plugin sources, and the read-only
+    capability probes are all resolved before the claim, so a bad
+    configuration fails the run without leaving a claimed conversation. The
+    execution claim is committed before the start call, so a crash or restart
+    reuses the same conversation id and the target's idempotent create dedupes
+    a repeat start. A run with a claim is never requeued. The watchdog's
     ``reconcile_governed_runs`` owns everything after the start.
     """
     target = resolve_target(run.target_id)
@@ -1984,10 +2017,53 @@ async def _execute_governed_run(
         )
         return
 
+    kind = classify_automation(
+        automation.preset_metadata,
+        automation.plugin_spec,
+        automation.tarball_path,
+        automation.entrypoint,
+    )
+    refusal = target_kind_error(target, kind)
+    if refusal is not None:
+        # A target can shrink its ``kinds`` after an automation is stored.
+        # Every run, triggered or manual, is refused by the same rule.
+        await fail(
+            refusal,
+            status_detail=make_run_status_detail(
+                phase=RunStatusPhase.DISPATCH,
+                kind=RunStatusDetailKind.UNKNOWN,
+                detail=refusal,
+                transient=False,
+                source="automation_service",
+                operation="validate_target",
+                code=CODE_TARGET_KIND_UNSUPPORTED,
+            ),
+        )
+        return
+
     start = await _governed_conversation_start(
-        automation, session_factory, fail, log_ctx
+        automation, kind, session_factory, fail, log_ctx
     )
     if start is None:
+        return
+
+    try:
+        prepared = await backend.prepare_start(client, automation, start)
+    except TargetCapabilityError as exc:
+        # The probes are read-only and run before the claim, so a config
+        # mismatch leaves no claimed conversation.
+        await fail(
+            str(exc),
+            status_detail=make_run_status_detail(
+                phase=RunStatusPhase.DISPATCH,
+                kind=RunStatusDetailKind.UNKNOWN,
+                detail=str(exc),
+                transient=False,
+                source="agent_server",
+                operation="preflight_start",
+                code=exc.code,
+            ),
+        )
         return
 
     claim = await claim_execution(session_factory, run, target)
@@ -1996,18 +2072,10 @@ async def _execute_governed_run(
             "Run left RUNNING before its claim; nothing to start", extra=log_ctx()
         )
         return
-    if run.conversation_id == claim.conversation_id:
-        # Another dispatch confirmed the start between the check above and the
-        # claim; a duplicate dispatch must not resend the task.
-        logger.info(
-            "Governed conversation %s already started",
-            claim.conversation_id,
-            extra=log_ctx(),
-        )
-        return
 
-    start.conversation_id = claim.conversation_id
-    outcome = await backend.start_conversation(client, automation, run, claim, start)
+    outcome = await backend.start_conversation(
+        client, automation, run, claim, start, prepared
+    )
     if outcome.confirmed:
         # The response named the exact claimed UUID: only now is it recorded.
         await record_started_conversation(session_factory, run, claim.conversation_id)
