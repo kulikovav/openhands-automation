@@ -63,6 +63,31 @@ def test_upgrade_adds_target_columns_on_an_empty_database(tmp_path):
     assert row == (None,)
 
 
+def test_upgrade_from_the_pre_136_fork_keeps_existing_columns(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'legacy-fork.db'}"
+    _alembic(db_url, "upgrade", "head")
+    _alembic(db_url, "downgrade", "043")
+
+    # The pre-1.36 fork applied its own revision 043 with these columns. The
+    # renamed revisions must recognise them instead of failing on the second
+    # ADD COLUMN.
+    with sqlite3.connect(tmp_path / "legacy-fork.db") as con:
+        con.execute("ALTER TABLE automations ADD COLUMN target_id VARCHAR(64)")
+        con.execute("ALTER TABLE automation_runs ADD COLUMN target_id VARCHAR(64)")
+        con.execute("ALTER TABLE automation_runs ADD COLUMN target_name VARCHAR(255)")
+        con.execute("ALTER TABLE automation_runs ADD COLUMN execution_claim JSON")
+        con.execute(
+            "ALTER TABLE automations ADD COLUMN retain_transcript BOOLEAN"
+            " NOT NULL DEFAULT 1"
+        )
+
+    _alembic(db_url, "upgrade", "head")
+
+    with sqlite3.connect(tmp_path / "legacy-fork.db") as con:
+        version = con.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert version == ("045",)
+
+
 def test_downgrade_removes_target_columns(tmp_path):
     db_url = f"sqlite:///{tmp_path / 'down.db'}"
     _alembic(db_url, "upgrade", "head")

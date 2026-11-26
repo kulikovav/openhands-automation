@@ -18,6 +18,13 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # The pre-1.36 fork added this column under revision 043. A database that
+    # ran that release already has it, so add only what is missing.
+    existing = {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("automations")
+    }
+    if "retain_transcript" in existing:
+        return
     # Existing automations keep their transcripts: the retention redesign
     # changes the old delete-at-terminal behavior into the opt-out.
     op.add_column(
