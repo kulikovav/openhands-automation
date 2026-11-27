@@ -109,6 +109,7 @@ from openhands.automation.tags import normalize_tag
 from openhands.automation.targets import (
     STOCK_PRESET_KINDS,
     classify_automation,
+    validate_run_shape,
     validate_target_selection,
 )
 from openhands.automation.telemetry import (
@@ -284,14 +285,18 @@ async def create_automation(
         if body.template is not None
         else None
     )
-    validate_target_selection(
-        body.target_id,
-        kind=classify_automation(
-            preset_metadata=preset_metadata,
-            plugin_spec=None,
-            tarball_path=body.tarball_path,
-            entrypoint=body.entrypoint,
-        ),
+    kind = classify_automation(
+        preset_metadata=preset_metadata,
+        plugin_spec=None,
+        tarball_path=body.tarball_path,
+        entrypoint=body.entrypoint,
+    )
+    validate_run_shape(
+        validate_target_selection(body.target_id, kind=kind),
+        kind=kind,
+        plugin_spec=None,
+        preset_metadata=preset_metadata,
+        tarball_path=body.tarball_path,
     )
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
@@ -1009,15 +1014,19 @@ async def update_automation(
                 ),
             )
     resulting_target_id = update_data.get("target_id", auto.target_id)
+    resulting_kind = classify_automation(
+        preset_metadata=auto.preset_metadata,
+        plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+        tarball_path=update_data.get("tarball_path", auto.tarball_path),
+        entrypoint=update_data.get("entrypoint", auto.entrypoint),
+    )
     if resulting_target_id or "target_id" in update_data:
-        validate_target_selection(
-            resulting_target_id,
-            kind=classify_automation(
-                preset_metadata=auto.preset_metadata,
-                plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
-                tarball_path=update_data.get("tarball_path", auto.tarball_path),
-                entrypoint=update_data.get("entrypoint", auto.entrypoint),
-            ),
+        validate_run_shape(
+            validate_target_selection(resulting_target_id, kind=resulting_kind),
+            kind=resulting_kind,
+            plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+            preset_metadata=auto.preset_metadata,
+            tarball_path=update_data.get("tarball_path", auto.tarball_path),
         )
     # Same ownership check as create. Only a new value is checked: resending the
     # stored path cannot grant anything the row does not already have, and that
@@ -1047,15 +1056,7 @@ async def update_automation(
     # records them in preset_metadata, so they are applied with the prompt below.
     repos_requested = "repos" in update_data
     update_data.pop("repos", None)
-    if repos_requested and (
-        classify_automation(
-            preset_metadata=auto.preset_metadata,
-            plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
-            tarball_path=update_data.get("tarball_path", auto.tarball_path),
-            entrypoint=update_data.get("entrypoint", auto.entrypoint),
-        )
-        not in STOCK_PRESET_KINDS
-    ):
+    if repos_requested and resulting_kind not in STOCK_PRESET_KINDS:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "Only prompt and plugin preset automations can update repos",

@@ -1,16 +1,19 @@
 """Execution targets: registry parsing, validation, capabilities, run snapshot."""
 
 import json
+import uuid
 
 import pytest
 from httpx import AsyncClient
 
 from openhands.automation.config import clear_config_cache
+from openhands.automation.models import TarballUpload, UploadStatus
 from openhands.automation.targets import (
     TargetConfigError,
     classify_automation,
     parse_targets,
 )
+from openhands.automation.utils.tarball_validation import build_internal_url
 
 
 pytestmark = pytest.mark.usefixtures("local_file_store")
@@ -19,6 +22,8 @@ BASE = "/api/automation/v1"
 TARGET_ID = "governed-1"
 TARGET_NAME = "Governed Sandbox"
 TARGET_SECRET = "sk-target-secret-do-not-leak"
+TEST_USER_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+TEST_ORG_ID = uuid.UUID("87654321-4321-8765-4321-876543218765")
 TARGET_ENTRY = {
     "id": TARGET_ID,
     "name": TARGET_NAME,
@@ -69,6 +74,44 @@ def _prompt_body(name: str, **extra) -> dict:
         "trigger": {"type": "cron", "schedule": "0 9 * * 1", "timezone": "UTC"},
         **extra,
     }
+
+
+def _ab_variant_body(name: str, **extra) -> dict:
+    """A plugin A/B preset: two variants and no stored sources of its own."""
+    return {
+        **_prompt_body(name, **extra),
+        "experiment_id": "ab-test",
+        "variants": [
+            {
+                "name": "control",
+                "weight": 50,
+                "plugins": [{"source": "github:owner/repo", "ref": "v1"}],
+            },
+            {
+                "name": "treatment",
+                "weight": 50,
+                "plugins": [{"source": "github:owner/repo", "ref": "v2"}],
+            },
+        ],
+    }
+
+
+async def _store_upload(session_factory) -> str:
+    """Record one completed internal upload the test caller owns."""
+    upload_id = uuid.uuid4()
+    async with session_factory() as session:
+        session.add(
+            TarballUpload(
+                id=upload_id,
+                user_id=TEST_USER_ID,
+                org_id=TEST_ORG_ID,
+                name="bundle",
+                status=UploadStatus.COMPLETED,
+                storage_path=f"uploads/{upload_id}.tar.gz",
+            )
+        )
+        await session.commit()
+    return build_internal_url(upload_id)
 
 
 def _error_codes(response) -> list[tuple[str | None, str]]:
@@ -315,7 +358,7 @@ class TestCreateValidation:
         assert "'plugin'" in response.json()["detail"][0]["msg"]
 
     async def test_a_target_runs_each_kind_it_lists(
-        self, async_client, targets_env, monkeypatch
+        self, async_client, async_session_factory, targets_env, monkeypatch
     ):
         _configure_kinds(monkeypatch, ["script", "custom_tarball", "plugin"])
         script = await async_client.post(
@@ -324,6 +367,7 @@ class TestCreateValidation:
                 "Script",
                 target_id=TARGET_ID,
                 template={"id": "bundle", "version": "1.0.0"},
+                tarball_path=await _store_upload(async_session_factory),
             ),
         )
         assert script.status_code == 201, script.text
@@ -375,6 +419,36 @@ class TestCreateValidation:
         assert body["target_name"] == TARGET_NAME
         assert TARGET_SECRET not in response.text
 
+    async def test_a_plugin_ab_preset_on_a_target_is_refused_at_create(
+        self, async_client, targets_env, monkeypatch
+    ):
+        """The A/B row stores no plugin sources, so a governed run can never
+        pick a variant; it is refused here instead of failing every run."""
+        _configure_kinds(monkeypatch, ["plugin"])
+        response = await async_client.post(
+            f"{BASE}/preset/plugin",
+            json=_ab_variant_body("A/B plugin", target_id=TARGET_ID),
+        )
+        assert response.status_code == 422
+        assert _error_codes(response) == [("target_id", "plugin_variants_unsupported")]
+
+    async def test_an_external_url_template_script_on_a_target_is_refused_at_create(
+        self, async_client, targets_env, monkeypatch
+    ):
+        """A script bundle must be a stored upload; a URL is never fetched by a
+        governed target, so the row would fail every run."""
+        _configure_kinds(monkeypatch, ["script"])
+        response = await async_client.post(
+            f"{BASE}",
+            json=_raw_body(
+                "Script",
+                target_id=TARGET_ID,
+                template={"id": "bundle", "version": "1.0.0"},
+            ),
+        )
+        assert response.status_code == 422
+        assert _error_codes(response) == [("target_id", "bundle_source_unsupported")]
+
 
 class TestUpdateValidation:
     async def _create_raw(self, client: AsyncClient, name: str = "Script") -> dict:
@@ -402,6 +476,37 @@ class TestUpdateValidation:
         )
         assert response.status_code == 200, response.text
         assert response.json()["target_id"] == TARGET_ID
+
+    async def test_a_plugin_ab_preset_refused_when_an_update_adds_a_target(
+        self, async_client, targets_env, monkeypatch
+    ):
+        """An A/B preset created on the default backend cannot move to a target."""
+        created = await async_client.post(
+            f"{BASE}/preset/plugin", json=_ab_variant_body("A/B plugin")
+        )
+        assert created.status_code == 201, created.text
+        _configure_kinds(monkeypatch, ["plugin"])
+        response = await async_client.patch(
+            f"{BASE}/{created.json()['id']}", json={"target_id": TARGET_ID}
+        )
+        assert response.status_code == 422
+        assert _error_codes(response) == [("target_id", "plugin_variants_unsupported")]
+
+    async def test_an_external_url_template_script_refused_when_an_update_adds_a_target(
+        self, async_client, targets_env, monkeypatch
+    ):
+        """A template script with a URL tarball cannot move to a target."""
+        created = await async_client.post(
+            f"{BASE}",
+            json=_raw_body("Script", template={"id": "bundle", "version": "1.0.0"}),
+        )
+        assert created.status_code == 201, created.text
+        _configure_kinds(monkeypatch, ["script"])
+        response = await async_client.patch(
+            f"{BASE}/{created.json()['id']}", json={"target_id": TARGET_ID}
+        )
+        assert response.status_code == 422
+        assert _error_codes(response) == [("target_id", "bundle_source_unsupported")]
 
     async def test_unknown_target_refused_at_update(self, async_client, targets_env):
         created = await async_client.post(

@@ -88,7 +88,10 @@ from openhands.automation.schemas import (
     reject_public_draft_state,
 )
 from openhands.automation.storage import FileStore, ObjectNotFoundError, get_file_store
-from openhands.automation.targets import validate_target_selection
+from openhands.automation.targets import (
+    validate_run_shape,
+    validate_target_selection,
+)
 from openhands.automation.telemetry import (
     automation_created_event,
     automation_created_properties,
@@ -1270,7 +1273,7 @@ async def create_automation_from_plugin(
     - With repo_path: subdirectory for monorepos
     """
     validate_agent_profile_combination(body.agent_profile_id, body.model)
-    validate_target_selection(body.target_id, kind="plugin")
+    target = validate_target_selection(body.target_id, kind="plugin")
     await authorize_factory_for_create(session, user, body.factory_id)
     await validate_parser_registry(
         session, user.org_id, body.factory_id, body.outcome_parsers
@@ -1300,6 +1303,26 @@ async def create_automation_from_plugin(
                 get_http_client(request), user_id=run_as.user_id, org_id=user.org_id
             ),
         )
+    # Built from the pinned body, so a service-account preset stores the SHAs.
+    preset_metadata: dict[str, Any] = {
+        "preset_type": "plugin",
+        "prompt": body.prompt,
+    }
+    if body.plugins:
+        preset_metadata["plugins"] = [
+            p.model_dump(exclude_none=True) for p in body.plugins
+        ]
+    if body.repos:
+        preset_metadata["repos"] = dump_repos(body.repos)
+    if body.template is not None:
+        preset_metadata["template"] = body.template.model_dump(exclude_none=True)
+    validate_run_shape(
+        target,
+        kind="plugin",
+        plugin_spec=None,
+        preset_metadata=preset_metadata,
+        tarball_path=None,
+    )
     model = (
         None
         if body.agent_profile_id
@@ -1370,19 +1393,6 @@ async def create_automation_from_plugin(
 
     # 3. Create the automation referencing the internal upload
     tarball_path = build_internal_url(upload_id)
-
-    preset_metadata: dict[str, Any] = {
-        "preset_type": "plugin",
-        "prompt": body.prompt,
-    }
-    if body.plugins:
-        preset_metadata["plugins"] = [
-            p.model_dump(exclude_none=True) for p in body.plugins
-        ]
-    if body.repos:
-        preset_metadata["repos"] = dump_repos(body.repos)
-    if body.template is not None:
-        preset_metadata["template"] = body.template.model_dump(exclude_none=True)
 
     try:
         await lock_factory_for_assignment(session, user.org_id, body.factory_id)

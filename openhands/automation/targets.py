@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 
+from openhands.automation.utils.tarball_validation import parse_internal_upload_id
+
 
 # The kinds the registry gates on. One union names a kind, and
 # ``classify_automation`` is the only place that decides one.
@@ -51,6 +53,9 @@ _REQUIRED_ENTRY_KEYS: Final[frozenset[str]] = frozenset(
 TARGET_FIELD: Final[str] = "target_id"
 CODE_TARGET_UNAVAILABLE: Final[str] = "target_unavailable"
 CODE_TARGET_KIND_UNSUPPORTED: Final[str] = "target_kind_unsupported"
+# A shape the target's kind gate admits but a run can never execute.
+CODE_PLUGIN_VARIANTS_UNSUPPORTED: Final[str] = "plugin_variants_unsupported"
+CODE_BUNDLE_SOURCE_UNSUPPORTED: Final[str] = "bundle_source_unsupported"
 
 
 class TargetConfigError(ValueError):
@@ -278,3 +283,43 @@ def validate_target_selection(
     if message is not None:
         raise target_field_error(field, CODE_TARGET_KIND_UNSUPPORTED, message)
     return target
+
+
+def validate_run_shape(
+    target: AutomationTarget | None,
+    *,
+    kind: AutomationKind,
+    plugin_spec: dict[str, Any] | None,
+    preset_metadata: dict[str, Any] | None,
+    tarball_path: str | None,
+    field: str = TARGET_FIELD,
+) -> None:
+    """Refuse a shape the selected target admits by kind but can never run.
+
+    Called at create and update, after ``validate_target_selection``. A
+    governed target runs a plugin preset's stored sources and a script from a
+    stored upload: an A/B experiment stores no sources, and a URL is not an
+    upload. Both would otherwise fail every run with a run-time refusal, and a
+    null target (the default backend) is never checked here. Dispatch keeps its
+    own run-time refusals as the backstop for a row stored before this check.
+    """
+    if target is None:
+        return
+    if (
+        kind == "plugin"
+        and plugin_spec is None
+        and is_plugin_experiment(preset_metadata)
+    ):
+        raise target_field_error(
+            field,
+            CODE_PLUGIN_VARIANTS_UNSUPPORTED,
+            "A plugin A/B preset runs only on the stock runner; a governed "
+            "target cannot pick a variant.",
+        )
+    if kind == "script" and parse_internal_upload_id(tarball_path or "") is None:
+        raise target_field_error(
+            field,
+            CODE_BUNDLE_SOURCE_UNSUPPORTED,
+            "A script automation on a governed target must carry a stored "
+            "upload; this tarball is a URL the target cannot fetch.",
+        )
