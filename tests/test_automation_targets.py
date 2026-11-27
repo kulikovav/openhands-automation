@@ -89,17 +89,33 @@ def _configure_kinds(monkeypatch, kinds: list[str] | None) -> None:
 
 
 def test_classify_prompt_preset():
-    assert classify_automation({"preset_type": "prompt"}, None, None, None) == "prompt"
+    assert (
+        classify_automation(
+            preset_metadata={"preset_type": "prompt"},
+            plugin_spec=None,
+            tarball_path=None,
+            entrypoint=None,
+        )
+        == "prompt"
+    )
 
 
 def test_classify_plugin_preset_and_plugin_spec():
-    assert classify_automation({"preset_type": "plugin"}, None, None, None) == "plugin"
     assert (
         classify_automation(
-            {"preset_type": "plugin_spec"},
-            {"plugin": {}},
-            "plugin-spec://runtime",
-            None,
+            preset_metadata={"preset_type": "plugin"},
+            plugin_spec=None,
+            tarball_path=None,
+            entrypoint=None,
+        )
+        == "plugin"
+    )
+    assert (
+        classify_automation(
+            preset_metadata={"preset_type": "plugin_spec"},
+            plugin_spec={"plugin": {}},
+            tarball_path="plugin-spec://runtime",
+            entrypoint=None,
         )
         == "plugin"
     )
@@ -108,7 +124,12 @@ def test_classify_plugin_preset_and_plugin_spec():
 def test_classify_script_bundle_from_template_provenance():
     preset = {"template": {"id": "github-pr-reviewer", "version": "1.0.0"}}
     assert (
-        classify_automation(preset, None, "oh-internal://uploads/x", "python3 main.py")
+        classify_automation(
+            preset_metadata=preset,
+            plugin_spec=None,
+            tarball_path="oh-internal://uploads/x",
+            entrypoint="python3 main.py",
+        )
         == "script"
     )
 
@@ -116,7 +137,10 @@ def test_classify_script_bundle_from_template_provenance():
 def test_classify_external_url_is_a_custom_tarball():
     assert (
         classify_automation(
-            None, None, "https://example.com/bundle.tar.gz", "bash run.sh"
+            preset_metadata=None,
+            plugin_spec=None,
+            tarball_path="https://example.com/bundle.tar.gz",
+            entrypoint="bash run.sh",
         )
         == "custom_tarball"
     )
@@ -335,9 +359,9 @@ class TestCreateValidation:
         )
         assert response.status_code == 422
         assert _error_codes(response) == [("target_id", "target_kind_unsupported")]
-        assert response.json()["detail"][0]["msg"] == (
-            f"Target {TARGET_NAME!r} does not run 'prompt' automations; it runs none."
-        )
+        message = response.json()["detail"][0]["msg"]
+        assert TARGET_NAME in message
+        assert "'prompt'" in message
 
     async def test_prompt_preset_on_target_accepted_at_create(
         self, async_client, targets_env

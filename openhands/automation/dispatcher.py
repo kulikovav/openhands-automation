@@ -23,7 +23,7 @@ import tarfile
 import uuid
 from collections.abc import Collection, Mapping
 from datetime import timedelta
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import httpx
 from fastapi import HTTPException
@@ -79,6 +79,7 @@ from openhands.automation.plugin_specs import (
     PluginSpecError,
     build_execution_payload,
     plugin_secret_names,
+    plugin_start_sources,
     resolve_plugin_spec,
 )
 from openhands.automation.preset_router import with_current_preset_runner
@@ -250,17 +251,6 @@ def _api_key_error_message(exc: APIKeyError, what: str) -> str:
     return f"Failed to get API key to {what}: {exc}"
 
 
-_PLUGIN_SOURCE_KEYS = frozenset({"source", "ref", "repo_path"})
-
-
-def _plugin_payload_source(source: dict[str, Any]) -> dict[str, Any]:
-    """One plugin source as a start payload names it: a pinned ref, no extras."""
-    item = {key: value for key, value in source.items() if key in _PLUGIN_SOURCE_KEYS}
-    if resolved_ref := source.get("resolved_ref"):
-        item["ref"] = resolved_ref
-    return item
-
-
 def _conversation_tags(automation: Automation, run: AutomationRun) -> dict[str, str]:
     """The tags the stock runners put on their conversations."""
     return {
@@ -293,10 +283,10 @@ def _conversation_start(
     Without the owner's connections (None) the runner clones them all.
     """
     kind = classify_automation(
-        automation.preset_metadata,
-        automation.plugin_spec,
-        automation.tarball_path,
-        automation.entrypoint,
+        preset_metadata=automation.preset_metadata,
+        plugin_spec=automation.plugin_spec,
+        tarball_path=automation.tarball_path,
+        entrypoint=automation.entrypoint,
     )
     if resolved_runtime is not None:
         if resolved_runtime.get("runner") != "conversation":
@@ -306,7 +296,7 @@ def _conversation_start(
         )
         # The agent profile owns the model for plugin-spec runs.
         llm_profile = None
-        plugins = [_plugin_payload_source(plugin) for plugin in plugin_fetches]
+        plugins = plugin_fetches
         repositories: list[dict[str, Any]] = []
     elif kind in STOCK_PRESET_KINDS:
         preset_plugins: list[dict[str, Any]] = []
@@ -319,7 +309,10 @@ def _conversation_start(
             preset_plugins = plugin_preset_sources(automation.preset_metadata)
         # The presets require the finish tool; the app server's start request
         # takes that requirement as a plugin (see utils/finish_plugin.py).
-        plugins = [{"source": finish_plugin_dir(str(run.id))}, *preset_plugins]
+        plugins = [
+            {"source": finish_plugin_dir(str(run.id))},
+            *plugin_start_sources(None, None, preset_plugins),
+        ]
         agent_profile_id = automation.agent_profile_id
         llm_profile = automation.model
         repositories = (
@@ -1802,45 +1795,43 @@ async def _execute_run(
     # The start call may have reached the agent server before it failed, so
     # this failure is not retryable: a second dispatch could run the
     # entrypoint twice in one workspace.
-    await _fail(
+    await _fail_dispatch(
+        _fail,
         error,
-        status_detail=make_run_status_detail(
-            phase=RunStatusPhase.EXECUTION,
-            kind=RunStatusDetailKind.EXECUTION_ERROR,
-            detail=error,
-            transient=False,
-            source="agent_server" if backend.is_local_mode else "sandbox_api",
-            operation="execute_in_context",
-        ),
+        phase=RunStatusPhase.EXECUTION,
+        detail_kind=RunStatusDetailKind.EXECUTION_ERROR,
+        source="agent_server" if backend.is_local_mode else "sandbox_api",
+        operation="execute_in_context",
     )
 
 
 async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
     """The plugin sources and config a governed conversation loads.
 
-    Each source keeps only ``source``, ``ref`` and ``repo_path``. A plugin
-    preset stores its sources in ``preset_metadata['plugins']``; an A/B
-    experiment deliberately stores none, and the caller refuses that run. A
-    plugin-spec automation stores the executable plugin, its validated config,
-    and either the pinned required plugins or the refs its manifest names,
-    resolved exactly as a stock run resolves them.
+    A plugin preset stores its sources in ``preset_metadata['plugins']``; an
+    A/B experiment deliberately stores none, and the caller refuses that run.
+    A plugin-spec automation stores the executable plugin, its validated
+    config, and either the pinned required plugins or the refs its manifest
+    names, resolved and pinned exactly as a stock run resolves them.
     """
     spec = automation.plugin_spec
     if spec is None:
-        return plugin_preset_sources(automation.preset_metadata)
+        return plugin_start_sources(
+            None, None, plugin_preset_sources(automation.preset_metadata)
+        )
     stored_required = spec.get("required_plugins")
     if stored_required is None:
         try:
-            _, _, _, required = await resolve_plugin_spec(
+            source, _manifest, resolved_ref, required = await resolve_plugin_spec(
                 spec, allow_local_sources=False
             )
         except (PluginSpecError, PluginSourceError) as exc:
             raise PluginSpecError(
                 f"Could not resolve the plugin's run-time plugins: {exc}"
             ) from exc
+        plugins = plugin_start_sources(source, resolved_ref, required)
     else:
-        required = stored_required
-    plugins = [_plugin_payload_source(source) for source in [spec["plugin"], *required]]
+        plugins = plugin_start_sources(None, None, [spec["plugin"], *stored_required])
     config = spec.get("config") or {}
     if config:
         plugins[0] = {**plugins[0], "config": config}
@@ -1859,12 +1850,58 @@ def _governed_bundle_config(automation: Automation) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
+class FailDispatch(Protocol):
+    """Mark a run failed, optionally disabling its automation."""
+
+    async def __call__(
+        self,
+        error: str,
+        *,
+        disable: bool = False,
+        status_detail: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None: ...
+
+
+class RunLogContext(Protocol):
+    """The structured log fields for one dispatched run."""
+
+    def __call__(self, sandbox_id: str | None = None) -> dict[str, Any]: ...
+
+
+async def _fail_dispatch(
+    fail: FailDispatch,
+    error: str,
+    *,
+    phase: RunStatusPhase,
+    detail_kind: RunStatusDetailKind,
+    source: str,
+    operation: str,
+    code: str | None = None,
+    disable: bool = False,
+) -> None:
+    """Fail a dispatched run with one non-transient status detail."""
+    await fail(
+        error,
+        disable=disable,
+        status_detail=make_run_status_detail(
+            phase=phase,
+            kind=detail_kind,
+            detail=error,
+            transient=False,
+            source=source,
+            operation=operation,
+            code=code,
+        ),
+    )
+
+
 async def _governed_conversation_start(
     automation: Automation,
     kind: AutomationKind,
     session_factory: async_sessionmaker[AsyncSession],
-    fail: Any,
-    log_ctx: Any,
+    fail: FailDispatch,
+    log_ctx: RunLogContext,
 ) -> ConversationStart | None:
     """The start contract for a governed run, or None once the run failed.
 
@@ -1879,36 +1916,28 @@ async def _governed_conversation_start(
         try:
             start.plugins = await _governed_plugin_sources(automation)
         except PluginSpecError as exc:
-            error = str(exc)
-            await fail(
-                error,
-                status_detail=make_run_status_detail(
-                    phase=RunStatusPhase.DISPATCH,
-                    kind=RunStatusDetailKind.UNKNOWN,
-                    detail=error,
-                    transient=False,
-                    source="automation_service",
-                    operation="prepare_plugins",
-                    code="plugin_spec_unresolved",
-                ),
+            await _fail_dispatch(
+                fail,
+                str(exc),
+                phase=RunStatusPhase.DISPATCH,
+                detail_kind=RunStatusDetailKind.UNKNOWN,
+                source="automation_service",
+                operation="prepare_plugins",
+                code="plugin_spec_unresolved",
             )
             return None
         if not start.plugins:
-            error = (
-                "A/B plugin variants run only on the stock runner; a governed "
-                "target cannot pick a variant"
-            )
-            await fail(
-                error,
-                status_detail=make_run_status_detail(
-                    phase=RunStatusPhase.DISPATCH,
-                    kind=RunStatusDetailKind.UNKNOWN,
-                    detail=error,
-                    transient=False,
-                    source="automation_service",
-                    operation="prepare_plugins",
-                    code="plugin_variants_unsupported",
+            await _fail_dispatch(
+                fail,
+                (
+                    "A/B plugin variants run only on the stock runner; a "
+                    "governed target cannot pick a variant"
                 ),
+                phase=RunStatusPhase.DISPATCH,
+                detail_kind=RunStatusDetailKind.UNKNOWN,
+                source="automation_service",
+                operation="prepare_plugins",
+                code="plugin_variants_unsupported",
             )
             return None
         return start
@@ -1917,21 +1946,17 @@ async def _governed_conversation_start(
 
     upload_id = parse_internal_upload_id(automation.tarball_path)
     if upload_id is None:
-        error = (
-            "A governed target runs a script from a stored upload; this "
-            "automation's tarball is a URL the target cannot fetch"
-        )
-        await fail(
-            error,
-            status_detail=make_run_status_detail(
-                phase=RunStatusPhase.DISPATCH,
-                kind=RunStatusDetailKind.UNKNOWN,
-                detail=error,
-                transient=False,
-                source="automation_service",
-                operation="prepare_bundle",
-                code="bundle_source_unsupported",
+        await _fail_dispatch(
+            fail,
+            (
+                "A governed target runs a script from a stored upload; this "
+                "automation's tarball is a URL the target cannot fetch"
             ),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="automation_service",
+            operation="prepare_bundle",
+            code="bundle_source_unsupported",
         )
         return None
     try:
@@ -1942,18 +1967,15 @@ async def _governed_conversation_start(
     except TarballNotFoundError as exc:
         # The upload is gone for good; the same condition disables an
         # automation on the default backend.
-        await fail(
+        await _fail_dispatch(
+            fail,
             str(exc),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+            source="automation_service",
+            operation="prepare_bundle",
+            code=type(exc).__name__,
             disable=True,
-            status_detail=make_run_status_detail(
-                phase=RunStatusPhase.DISPATCH,
-                kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
-                detail=str(exc),
-                transient=False,
-                source="automation_service",
-                operation="prepare_bundle",
-                code=type(exc).__name__,
-            ),
         )
         return None
     start.bundle = AutomationBundle(
@@ -1977,8 +1999,8 @@ async def _execute_governed_run(
     session_factory: async_sessionmaker[AsyncSession],
     client: httpx.AsyncClient,
     effective_timeout: int,
-    fail: Any,
-    log_ctx: Any,
+    fail: FailDispatch,
+    log_ctx: RunLogContext,
 ) -> None:
     """Dispatch a governed run as one conversation on its execution target.
 
@@ -1992,18 +2014,14 @@ async def _execute_governed_run(
     """
     target = resolve_target(run.target_id)
     if target is None:
-        error = f"Execution target {run.target_id!r} is no longer configured"
-        await fail(
-            error,
-            status_detail=make_run_status_detail(
-                phase=RunStatusPhase.DISPATCH,
-                kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
-                detail=error,
-                transient=False,
-                source="automation_service",
-                operation="resolve_target",
-                code=CODE_TARGET_UNAVAILABLE,
-            ),
+        await _fail_dispatch(
+            fail,
+            f"Execution target {run.target_id!r} is no longer configured",
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+            source="automation_service",
+            operation="resolve_target",
+            code=CODE_TARGET_UNAVAILABLE,
         )
         return
 
@@ -2018,26 +2036,23 @@ async def _execute_governed_run(
         return
 
     kind = classify_automation(
-        automation.preset_metadata,
-        automation.plugin_spec,
-        automation.tarball_path,
-        automation.entrypoint,
+        preset_metadata=automation.preset_metadata,
+        plugin_spec=automation.plugin_spec,
+        tarball_path=automation.tarball_path,
+        entrypoint=automation.entrypoint,
     )
     refusal = target_kind_error(target, kind)
     if refusal is not None:
         # A target can shrink its ``kinds`` after an automation is stored.
         # Every run, triggered or manual, is refused by the same rule.
-        await fail(
+        await _fail_dispatch(
+            fail,
             refusal,
-            status_detail=make_run_status_detail(
-                phase=RunStatusPhase.DISPATCH,
-                kind=RunStatusDetailKind.UNKNOWN,
-                detail=refusal,
-                transient=False,
-                source="automation_service",
-                operation="validate_target",
-                code=CODE_TARGET_KIND_UNSUPPORTED,
-            ),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="automation_service",
+            operation="validate_target",
+            code=CODE_TARGET_KIND_UNSUPPORTED,
         )
         return
 
@@ -2052,17 +2067,14 @@ async def _execute_governed_run(
     except TargetCapabilityError as exc:
         # The probes are read-only and run before the claim, so a config
         # mismatch leaves no claimed conversation.
-        await fail(
+        await _fail_dispatch(
+            fail,
             str(exc),
-            status_detail=make_run_status_detail(
-                phase=RunStatusPhase.DISPATCH,
-                kind=RunStatusDetailKind.UNKNOWN,
-                detail=str(exc),
-                transient=False,
-                source="agent_server",
-                operation="preflight_start",
-                code=exc.code,
-            ),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="agent_server",
+            operation="preflight_start",
+            code=exc.code,
         )
         return
 

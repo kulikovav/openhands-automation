@@ -184,6 +184,7 @@ def target_name_of(target_id: str | None) -> str | None:
 
 
 def classify_automation(
+    *,
     preset_metadata: dict[str, Any] | None,
     plugin_spec: dict[str, Any] | None,
     tarball_path: str | None,

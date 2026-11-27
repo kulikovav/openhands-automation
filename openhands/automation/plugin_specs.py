@@ -1258,7 +1258,7 @@ async def build_execution_payload(
         allow_local_sources=allow_local_sources,
         secrets=await secrets(plugin_secret_names(required_sources)),
     )
-    plugin_fetches = _plugin_fetch_requests(source, resolved_ref, required_plugins)
+    plugin_fetches = plugin_start_sources(source, resolved_ref, required_plugins)
     if agent_profile_name is None and manifest.runtime.agent_profile is not None:
         agent_profile_name = manifest.runtime.agent_profile.default_name
 
@@ -1294,11 +1294,7 @@ async def build_execution_payload(
             # tarball carries the script. Skip the agent-server pre-fetch for
             # the main plugin (which rejects catalog plugins for lacking
             # .plugin/plugin.json) and only fetch declared runtime plugins.
-            plugin_fetches = _plugin_fetch_requests(
-                source=None,
-                resolved_ref=resolved_ref,
-                required_plugins=required_plugins,
-            )
+            plugin_fetches = plugin_start_sources(None, resolved_ref, required_plugins)
         tarball = _build_runtime_metadata_tarball(
             manifest=manifest,
             config=config,
@@ -1523,6 +1519,9 @@ def conversation_prompt(
     return prompt
 
 
+_PLUGIN_SOURCE_KEYS = frozenset({"source", "ref", "repo_path"})
+
+
 def _resolved_plugin_source(
     plugin: AutomationPluginSource, resolved_ref: str | None
 ) -> dict[str, Any]:
@@ -1532,28 +1531,31 @@ def _resolved_plugin_source(
     return data
 
 
-def _plugin_config_sources(
+def plugin_payload_source(source: Mapping[str, Any]) -> dict[str, Any]:
+    """One plugin source as a start payload names it: a pinned ref, no extras."""
+    item = {key: value for key, value in source.items() if key in _PLUGIN_SOURCE_KEYS}
+    if resolved_ref := source.get("resolved_ref"):
+        item["ref"] = resolved_ref
+    return item
+
+
+def plugin_start_sources(
     source: AutomationPluginSource | None,
     resolved_ref: str | None,
-    required_plugins: list[dict[str, Any]],
+    plugins: Iterable[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
-    sources: list[dict[str, Any]] = []
+    """The plugins a run loads, each pinned to its resolved ref.
+
+    ``source`` is the executable plugin; ``plugins`` are sources that already
+    carry a ref, a spec's stored pins or a preset's plugins. The start payload
+    and the runner's ``plugins_config.json`` both name plugins this way, so one
+    payload has one semantic.
+    """
+    resolved: list[Mapping[str, Any]] = []
     if source is not None:
-        sources.append(_resolved_plugin_source(source, resolved_ref))
-    for plugin in required_plugins:
-        item = {k: v for k, v in plugin.items() if k != "resolved_ref"}
-        if resolved_ref := plugin.get("resolved_ref"):
-            item["ref"] = resolved_ref
-        sources.append(item)
-    return sources
-
-
-def _plugin_fetch_requests(
-    source: AutomationPluginSource | None,
-    resolved_ref: str | None,
-    required_plugins: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return _plugin_config_sources(source, resolved_ref, required_plugins)
+        resolved.append(_resolved_plugin_source(source, resolved_ref))
+    resolved.extend(plugins)
+    return [plugin_payload_source(plugin) for plugin in resolved]
 
 
 def _build_stock_runner_tarball(
@@ -1578,7 +1580,7 @@ def _build_stock_runner_tarball(
         _add_json(
             tar,
             "plugins_config.json",
-            _plugin_config_sources(source, resolved_ref, required_plugins),
+            plugin_start_sources(source, resolved_ref, required_plugins),
         )
         _add_json(tar, f"{AUTOMATION_DIR}/config.json", config)
         _add_json(tar, f"{AUTOMATION_DIR}/execution.json", resolved_runtime)

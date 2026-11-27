@@ -33,7 +33,7 @@ from openhands.automation.models import (
     TarballUpload,
     UploadStatus,
 )
-from openhands.automation.plugin_specs import PluginSpecError
+from openhands.automation.plugin_specs import AutomationPluginSource, PluginSpecError
 from openhands.automation.targets import resolve_target
 from openhands.automation.utils.tarball_validation import build_internal_url
 from openhands.automation.utils.time import utcnow
@@ -863,7 +863,7 @@ class TestGovernedPlugins:
     async def test_a_plugin_spec_resolves_the_manifest_plugins(
         self, async_session_factory, targets_env, monkeypatch
     ):
-        """A spec without pinned plugins uses the stock manifest resolution."""
+        """A spec without pinned plugins pins the refs stock runs resolve."""
         run = await make_run(
             async_session_factory,
             preset_metadata={"preset_type": "plugin_spec"},
@@ -874,10 +874,10 @@ class TestGovernedPlugins:
 
         async def fake_resolve(spec, **kwargs):  # noqa: ARG001
             return (
+                AutomationPluginSource.model_validate(spec["plugin"]),
                 None,
-                None,
-                "abc",
-                [{"source": "github:owner/required", "resolved_ref": "deadbeef"}],
+                "deadbeef",
+                [{"source": "github:owner/required", "resolved_ref": "cafebabe"}],
             )
 
         monkeypatch.setattr(
@@ -889,8 +889,8 @@ class TestGovernedPlugins:
 
         [payload] = server.payloads
         assert payload["plugins"] == [
-            {"source": "github:owner/automation", "ref": "abc"},
-            {"source": "github:owner/required", "ref": "deadbeef"},
+            {"source": "github:owner/automation", "ref": "deadbeef"},
+            {"source": "github:owner/required", "ref": "cafebabe"},
         ]
 
     async def test_a_plugin_spec_that_cannot_resolve_its_plugins_fails_closed(

@@ -3012,7 +3012,7 @@ class TestUpdateAutomation:
 
     @pytest.mark.parametrize(
         "preset_metadata",
-        [None, {"template": {"id": "bundle"}}, {"preset_type": "plugin_spec"}],
+        [None, {"template": {"id": "bundle"}}],
     )
     async def test_update_repos_on_other_automations_returns_422(
         self, async_client, async_session, preset_metadata
@@ -3042,6 +3042,41 @@ class TestUpdateAutomation:
         assert response.json()["detail"] == (
             "Only prompt and plugin preset automations can update repos"
         )
+
+    async def test_update_repos_on_a_plugin_spec_automation_is_refused(
+        self, async_client, async_session
+    ):
+        """A plugin-spec row is kind ``plugin`` and has no preset tarball to rewrite.
+
+        ``classify_automation`` counts ``preset_type="plugin_spec"`` as the
+        plugin kind, so the early preset check passes. The edit is refused where
+        the tarball must be rebuilt instead, because this row has none.
+        """
+        # Arrange — a plugin-spec automation, which stores no repos.
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Plugin Spec",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="plugin-spec://runtime",
+            entrypoint="python3 main.py",
+            preset_metadata={"preset_type": "plugin_spec"},
+        )
+        async_session.add(automation)
+        await async_session.commit()
+        original_tarball_path = automation.tarball_path
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"repos": [{"url": "owner/repo", "provider": "github"}]},
+        )
+
+        # Assert — nothing changed.
+        assert response.status_code == 422
+        await async_session.refresh(automation)
+        assert automation.tarball_path == original_tarball_path
+        assert automation.preset_metadata == {"preset_type": "plugin_spec"}
 
     async def test_update_repos_rejects_an_invalid_repository(
         self, async_client, async_session, preset_store

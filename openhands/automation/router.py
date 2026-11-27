@@ -287,7 +287,10 @@ async def create_automation(
     validate_target_selection(
         body.target_id,
         kind=classify_automation(
-            preset_metadata, None, body.tarball_path, body.entrypoint
+            preset_metadata=preset_metadata,
+            plugin_spec=None,
+            tarball_path=body.tarball_path,
+            entrypoint=body.entrypoint,
         ),
     )
     await authorize_factory_for_create(session, user, body.factory_id)
@@ -1010,10 +1013,10 @@ async def update_automation(
         validate_target_selection(
             resulting_target_id,
             kind=classify_automation(
-                auto.preset_metadata,
-                update_data.get("plugin_spec", auto.plugin_spec),
-                update_data.get("tarball_path", auto.tarball_path),
-                update_data.get("entrypoint", auto.entrypoint),
+                preset_metadata=auto.preset_metadata,
+                plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+                tarball_path=update_data.get("tarball_path", auto.tarball_path),
+                entrypoint=update_data.get("entrypoint", auto.entrypoint),
             ),
         )
     # Same ownership check as create. Only a new value is checked: resending the
@@ -1044,9 +1047,14 @@ async def update_automation(
     # records them in preset_metadata, so they are applied with the prompt below.
     repos_requested = "repos" in update_data
     update_data.pop("repos", None)
-    if (
-        repos_requested
-        and (auto.preset_metadata or {}).get("preset_type") not in STOCK_PRESET_KINDS
+    if repos_requested and (
+        classify_automation(
+            preset_metadata=auto.preset_metadata,
+            plugin_spec=update_data.get("plugin_spec", auto.plugin_spec),
+            tarball_path=update_data.get("tarball_path", auto.tarball_path),
+            entrypoint=update_data.get("entrypoint", auto.entrypoint),
+        )
+        not in STOCK_PRESET_KINDS
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1722,10 +1730,10 @@ async def dispatch_automation(
     validate_target_selection(
         auto.target_id,
         kind=classify_automation(
-            auto.preset_metadata,
-            auto.plugin_spec,
-            auto.tarball_path,
-            auto.entrypoint,
+            preset_metadata=auto.preset_metadata,
+            plugin_spec=auto.plugin_spec,
+            tarball_path=auto.tarball_path,
+            entrypoint=auto.entrypoint,
         ),
     )
     # One in-flight manual run per automation and target, refused the same way

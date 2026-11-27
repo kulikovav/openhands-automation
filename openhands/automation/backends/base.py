@@ -49,7 +49,8 @@ class AutomationBundle:
     def to_payload(self) -> dict[str, Any]:
         """The start payload's ``bundle``: every field, with the archive encoded.
 
-        Built from the dataclass fields, so a new field cannot be dropped here.
+        ``asdict`` carries every dataclass field under its own name; only the
+        archive is renamed on the way out, from ``tarball`` to ``tarball_b64``.
         """
         payload = asdict(self)
         payload["tarball_b64"] = base64.b64encode(payload.pop("tarball")).decode(
