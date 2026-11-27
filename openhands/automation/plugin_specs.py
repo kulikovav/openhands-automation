@@ -1204,18 +1204,21 @@ async def resolve_plugin_spec(
     plugin_spec: dict[str, Any],
     *,
     allow_local_sources: bool = True,
+    secrets: PluginSecretLookup = no_plugin_secrets,
 ) -> tuple[
     AutomationPluginSource, AutomationPluginManifest, str | None, list[dict[str, Any]]
 ]:
     """Resolve a plugin spec's executable source and the plugins it runs with.
 
-    For a governed run that only needs the sources. No secrets are passed, so
-    a private source's placeholders are not expanded; the governed caller
-    refuses that source when the fetch fails.
+    For a governed run that only needs the sources. ``secrets`` resolves the
+    placeholders of a private source; a governed caller passes the target's
+    own secret store, because the target is what fetches the plugin.
     """
     source = AutomationPluginSource.model_validate(plugin_spec["plugin"])
     resolved_ref, manifest = preflight_manifest(
-        source, allow_local_sources=allow_local_sources
+        source,
+        allow_local_sources=allow_local_sources,
+        secrets=await secrets(plugin_secret_names([source])),
     )
     required_sources = required_plugin_sources(plugin_spec, manifest)
     required_plugins = validate_required_plugins(

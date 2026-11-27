@@ -18,6 +18,7 @@ from openhands.automation.backends.governed import (
     GOVERNED_START_GRACE_SECONDS,
     ConversationGoneError,
     ExecutionClaim,
+    GovernedConversationBackend,
     TranscriptOutcome,
     cancel_governed_conversation,
     claim_execution,
@@ -33,11 +34,16 @@ from openhands.automation.models import (
     TarballUpload,
     UploadStatus,
 )
-from openhands.automation.plugin_specs import AutomationPluginSource, PluginSpecError
+from openhands.automation.plugin_specs import (
+    AutomationPluginSource,
+    PluginSpecError,
+    preflight_manifest,
+)
 from openhands.automation.targets import resolve_target
 from openhands.automation.utils.tarball_validation import build_internal_url
 from openhands.automation.utils.time import utcnow
 from openhands.automation.watchdog import reconcile_governed_runs
+from tests.private_git_server import PrivateGitServer, SecretStoreServer, make_bare_repo
 
 
 TEST_USER_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
@@ -957,6 +963,136 @@ class TestGovernedPlugins:
         assert stored.status_detail["code"] == "plugin_spec_unresolved"
         assert stored.execution_claim is None
         assert server.posts("/api/conversations") == 0
+
+
+class TestGovernedPluginSecrets:
+    """A private plugin source resolves through the target's own store."""
+
+    SESSION_KEY = "fake-session-key"
+    PLUGIN_TOKEN = "fake-git-token-0123456789"
+
+    async def test_the_references_name_the_targets_secret_store(
+        self, async_session_factory, targets_env
+    ):
+        run = await make_run(async_session_factory)
+        backend = GovernedConversationBackend(run)
+
+        secrets = await backend.plugin_source_secrets(
+            httpx.AsyncClient(), ["PLUGIN_TOKEN"]
+        )
+
+        reference = secrets.preflight["PLUGIN_TOKEN"]
+        assert reference.url == f"{TARGET_URL}/api/settings/secrets/PLUGIN_TOKEN"
+        assert reference.headers == {"X-Session-API-Key": TARGET_SECRET}
+        # The target resolves its own references when it fetches the plugin.
+        assert secrets.fetch == {}
+
+    async def test_a_private_source_resolves_through_the_target_store(
+        self, async_session_factory, monkeypatch, tmp_path
+    ):
+        sha = make_bare_repo(
+            tmp_path,
+            "plugin",
+            {
+                ".plugin/plugin.json": json.dumps(
+                    {
+                        "name": "private-plugin",
+                        "version": "0.1.0",
+                        "description": "A plugin in a private repository",
+                        "automation": {
+                            "schema_version": "openhands.automation.plugin.v1",
+                            "entrypoint": {
+                                "runner": "script",
+                                "command": "bash run.sh",
+                            },
+                        },
+                    }
+                ),
+                "run.sh": "echo private plugin\n",
+            },
+        )
+        with (
+            PrivateGitServer(tmp_path, self.PLUGIN_TOKEN) as git_server,
+            SecretStoreServer(
+                self.SESSION_KEY, {"PLUGIN_TOKEN": self.PLUGIN_TOKEN}
+            ) as store,
+        ):
+            monkeypatch.setenv(
+                "AUTOMATION_TARGETS",
+                json.dumps(
+                    [
+                        {
+                            **TARGET_ENTRY,
+                            "url": store.url,
+                            "api_key": self.SESSION_KEY,
+                        }
+                    ]
+                ),
+            )
+            clear_config_cache()
+            run = await make_run(async_session_factory)
+            backend = GovernedConversationBackend(run)
+            host = git_server.url.removeprefix("http://")
+
+            secrets = await backend.plugin_source_secrets(
+                httpx.AsyncClient(), ["PLUGIN_TOKEN"]
+            )
+            resolved_ref, manifest = preflight_manifest(
+                AutomationPluginSource(
+                    source=f"http://x-access-token:${{PLUGIN_TOKEN}}@{host}/plugin.git"
+                ),
+                secrets=secrets.preflight,
+            )
+
+        assert resolved_ref == sha
+        assert manifest.name == "private-plugin"
+        assert store.requests == ["/api/settings/secrets/PLUGIN_TOKEN"]
+
+    async def test_a_plugin_spec_is_resolved_with_the_target_lookup(
+        self, async_session_factory, targets_env, monkeypatch
+    ):
+        run = await make_run(
+            async_session_factory,
+            preset_metadata={"preset_type": "plugin_spec"},
+            plugin_spec={
+                "plugin": {
+                    "source": "https://x:${PLUGIN_TOKEN}@private.example/plugin.git",
+                    "ref": "abc",
+                }
+            },
+        )
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.capabilities = ["conversation_plugins_v1"]
+        seen = {}
+
+        async def fake_resolve(spec, **kwargs):
+            seen["reference"] = (await kwargs["secrets"](["PLUGIN_TOKEN"]))[
+                "PLUGIN_TOKEN"
+            ]
+            return (
+                AutomationPluginSource.model_validate(spec["plugin"]),
+                None,
+                "deadbeef",
+                [],
+            )
+
+        monkeypatch.setattr(
+            "openhands.automation.backends.governed.resolve_plugin_spec", fake_resolve
+        )
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        [payload] = server.payloads
+        assert payload["plugins"] == [
+            {
+                "source": "https://x:${PLUGIN_TOKEN}@private.example/plugin.git",
+                "ref": "deadbeef",
+            }
+        ]
+        reference = seen["reference"]
+        assert reference.url == f"{TARGET_URL}/api/settings/secrets/PLUGIN_TOKEN"
+        assert reference.headers == {"X-Session-API-Key": TARGET_SECRET}
 
 
 class TestReconcileByState:

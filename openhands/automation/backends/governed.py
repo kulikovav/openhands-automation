@@ -22,11 +22,11 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Final, Protocol
+from typing import Any, Final, Protocol
 from urllib.parse import quote
 
 import httpx
@@ -42,8 +42,11 @@ from openhands.automation.backends.base import (
 from openhands.automation.config import get_config
 from openhands.automation.exceptions import TarballNotFoundError
 from openhands.automation.models import Automation, AutomationRun, AutomationRunStatus
+from openhands.automation.plugin_secrets import PluginSourceSecrets
 from openhands.automation.plugin_specs import (
+    PluginSecretLookup,
     PluginSpecError,
+    no_plugin_secrets,
     plugin_start_sources,
     resolve_plugin_spec,
 )
@@ -72,11 +75,9 @@ from openhands.automation.utils.run_status_detail import (
 from openhands.automation.utils.tarball_validation import parse_internal_upload_id
 from openhands.automation.utils.time import ensure_utc, utcnow
 from openhands.sdk.plugin import PluginSourceError
+from openhands.sdk.secret import LookupSecret, SecretValue
 from openhands.workspace import RepoSource
 
-
-if TYPE_CHECKING:
-    from openhands.automation.plugin_secrets import PluginSourceSecrets
 
 logger = logging.getLogger("automation.governed")
 
@@ -495,10 +496,28 @@ class GovernedConversationBackend(ExecutionBackend):
     async def plugin_source_secrets(
         self,
         client: httpx.AsyncClient,  # noqa: ARG002
-        names: Collection[str],  # noqa: ARG002
+        names: Collection[str],
     ) -> PluginSourceSecrets:
-        raise PluginSpecError(
-            "A governed run's plugin sources are fetched by its target"
+        """Lookup references into the target's own secret store.
+
+        A governed run's plugins are fetched by its target, and this service's
+        preflight fetches their manifests. Both read the target's
+        ``/api/settings/secrets/{name}`` route, the one ``configured_secrets``
+        lists, so a private source resolves without a new credential channel.
+        The fetch half stays empty: the target resolves its own references.
+        """
+        if not names:
+            return PluginSourceSecrets()
+        target = self._require_target()
+        headers = self._headers()
+        return PluginSourceSecrets(
+            preflight={
+                name: LookupSecret(
+                    url=f"{target.url}{SECRETS_PATH}/{quote(name, safe='')}",
+                    headers=headers,
+                )
+                for name in names
+            }
         )
 
     def build_env_vars(self) -> dict[str, str]:
@@ -996,7 +1015,10 @@ async def cancel_governed_conversation(
     )
 
 
-async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
+async def _governed_plugin_sources(
+    automation: Automation,
+    secrets: PluginSecretLookup = no_plugin_secrets,
+) -> list[dict[str, Any]]:
     """The plugin sources and config a governed conversation loads.
 
     A plugin preset stores its sources in ``preset_metadata['plugins']``; an
@@ -1004,9 +1026,10 @@ async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any
     A plugin-spec automation stores the executable plugin, its validated
     config, and either the pinned required plugins or the refs its manifest
     names. Those refs are resolved and pinned the way a stock run resolves
-    them, with two differences: a local source is refused, and no secrets are
-    passed, so a private source's placeholders are not expanded. The config
-    rides the start; no governed plugin loader reads it yet.
+    them, with two differences: a local source is refused, and ``secrets``
+    resolves a private source from the target's own store, because the target
+    is what fetches the plugin at run time. The config rides the start; no
+    governed plugin loader reads it yet.
     """
     spec = automation.plugin_spec
     if spec is None:
@@ -1017,7 +1040,7 @@ async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any
     if stored_required is None:
         try:
             source, _manifest, resolved_ref, required = await resolve_plugin_spec(
-                spec, allow_local_sources=False
+                spec, allow_local_sources=False, secrets=secrets
             )
         except (PluginSpecError, PluginSourceError) as exc:
             raise PluginSpecError(
@@ -1094,6 +1117,8 @@ async def _governed_conversation_start(
     automation: Automation,
     kind: AutomationKind,
     session_factory: async_sessionmaker[AsyncSession],
+    backend: GovernedConversationBackend,
+    client: httpx.AsyncClient,
     fail: FailDispatch,
     log_ctx: RunLogContext,
 ) -> ConversationStart | None:
@@ -1101,14 +1126,21 @@ async def _governed_conversation_start(
 
     A script or custom-tarball run carries one bundle, read from the upload
     store and never extracted here. A plugin run carries its sources and
-    config. A plugin A/B experiment is refused: only the stock runner can pick
-    a variant. ``kind`` is classified once by the caller, which also checks it
-    against the target's allowed kinds.
+    config, resolved with the target's own secret store. A plugin A/B
+    experiment is refused: only the stock runner can pick a variant. ``kind``
+    is classified once by the caller, which also checks it against the
+    target's allowed kinds.
     """
+
+    async def target_secrets(names: Collection[str]) -> Mapping[str, SecretValue]:
+        if not names:
+            return {}
+        return (await backend.plugin_source_secrets(client, names)).preflight
+
     start = ConversationStart()
     if kind == "plugin":
         try:
-            start.plugins = await _governed_plugin_sources(automation)
+            start.plugins = await _governed_plugin_sources(automation, target_secrets)
         except PluginSpecError as exc:
             await _fail_dispatch(
                 fail,
@@ -1255,7 +1287,7 @@ async def _execute_governed_run(
         return
 
     start = await _governed_conversation_start(
-        automation, kind, session_factory, fail, log_ctx
+        automation, kind, session_factory, backend, client, fail, log_ctx
     )
     if start is None:
         return
