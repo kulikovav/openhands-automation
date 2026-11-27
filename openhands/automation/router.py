@@ -1442,7 +1442,15 @@ async def _pin_plugins_for_run_as_change(
         auto.plugin_spec = runtime_fields["plugin_spec"]
         auto.entrypoint = runtime_fields["entrypoint"]
         auto.setup_script_path = runtime_fields["setup_script_path"]
-    elif (auto.preset_metadata or {}).get("preset_type") == "plugin":
+    elif (
+        classify_automation(
+            preset_metadata=auto.preset_metadata,
+            plugin_spec=auto.plugin_spec,
+            tarball_path=auto.tarball_path,
+            entrypoint=auto.entrypoint,
+        )
+        == "plugin"
+    ):
         plugins = (auto.preset_metadata or {}).get("plugins")
         if plugins is None:
             raise HTTPException(
