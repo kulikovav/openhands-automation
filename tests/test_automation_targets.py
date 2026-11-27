@@ -185,7 +185,7 @@ def test_empty_kinds_runs_no_automation():
 
 
 def test_unknown_kind_is_rejected_by_name():
-    with pytest.raises(TargetConfigError, match="kinds must be a list"):
+    with pytest.raises(TargetConfigError, match="kinds must be a list.*host_bash"):
         parse_targets(json.dumps([{**TARGET_ENTRY, "kinds": ["prompt", "host_bash"]}]))
 
 

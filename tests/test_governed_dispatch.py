@@ -123,6 +123,7 @@ class FakeGovernedServer:
         self.delete_status = 200
         self.records: dict[str, tuple[int, dict]] = {}
         self.create_acks: list[int | str] = []
+        self.create_error_body: object = _UNSET
         self.fail_create_with_read_timeout = False
         self.secrets: list[dict] = []
         self.secret_status = 200
@@ -177,7 +178,11 @@ class FakeGovernedServer:
                 body = (
                     {"id": conversation_id}
                     if ack in (200, 201)
-                    else {"detail": "refused"}
+                    else (
+                        self.create_error_body
+                        if self.create_error_body is not _UNSET
+                        else {"detail": "refused"}
+                    )
                 )
                 return httpx.Response(ack, json=body)
             return httpx.Response(200 if replay else 201, json={"id": conversation_id})
@@ -384,6 +389,39 @@ class TestDispatchOnce:
         assert stored.status_detail["code"] == "target_kind_unsupported"
         assert stored.execution_claim is None
         assert server.requests == []
+
+
+class TestStartFailureDetail:
+    """A refused start records the field names, never the target's body."""
+
+    async def test_a_4xx_body_is_not_copied_into_the_run(
+        self, async_session_factory, targets_env
+    ):
+        marker = "TARBALLMARKERNOTBASE64"
+        run = await make_run(async_session_factory)
+        server = FakeGovernedServer(async_session_factory, run.id)
+        server.create_acks = [422]
+        server.create_error_body = {
+            "detail": [
+                {
+                    "loc": ["body", "bundle", "tarball_b64"],
+                    "msg": f"The archive {marker} is not valid base64",
+                    "type": "value_error",
+                    "input": marker,
+                }
+            ]
+        }
+
+        async with server.client() as client:
+            await dispatch(run, async_session_factory, client)
+
+        stored = await reload_run(async_session_factory, run.id)
+        assert stored.status == AutomationRunStatus.FAILED
+        assert stored.status_detail is not None
+        assert stored.status_detail["code"] == "conversation_error"
+        assert "bundle.tarball_b64" in (stored.error_detail or "")
+        assert marker not in (stored.error_detail or "")
+        assert marker not in json.dumps(stored.status_detail)
 
 
 class TestConfiguredSecretsAndRepositories:

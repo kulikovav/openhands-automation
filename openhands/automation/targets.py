@@ -24,8 +24,9 @@ from fastapi import HTTPException, status
 AutomationKind = Literal["prompt", "script", "plugin", "custom_tarball"]
 AUTOMATION_KINDS: Final[tuple[AutomationKind, ...]] = get_args(AutomationKind)
 
-# The kinds the stock runner starts a conversation for; the rest ride a bundle
-# a governed target unpacks.
+# The kinds a conversation start runs from a preset. The rest ride one bundle,
+# which the service builds from a stored upload: a custom tarball with an
+# external URL is refused at dispatch.
 STOCK_PRESET_KINDS: Final[tuple[AutomationKind, ...]] = ("prompt", "plugin")
 BUNDLE_KINDS: Final[tuple[AutomationKind, ...]] = ("script", "custom_tarball")
 
@@ -136,12 +137,19 @@ def parse_targets(raw: str) -> dict[str, AutomationTarget]:
             raise TargetConfigError(f"{where}: capability must be a string")
         kinds = entry.get("kinds")
         if kinds is not None:
-            if not isinstance(kinds, list) or any(
-                not isinstance(kind, str) or kind not in AUTOMATION_KINDS
-                for kind in kinds
-            ):
+            rejected = (
+                [
+                    kind
+                    for kind in kinds
+                    if not isinstance(kind, str) or kind not in AUTOMATION_KINDS
+                ]
+                if isinstance(kinds, list)
+                else []
+            )
+            if not isinstance(kinds, list) or rejected:
                 raise TargetConfigError(
-                    f"{where}: kinds must be a list of {list(AUTOMATION_KINDS)}"
+                    f"{where}: kinds must be a list of {list(AUTOMATION_KINDS)}; "
+                    f"got {kinds!r}"
                 )
             kinds = tuple(dict.fromkeys(kinds))
         targets[target_id] = AutomationTarget(

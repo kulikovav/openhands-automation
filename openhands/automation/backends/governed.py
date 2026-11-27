@@ -330,6 +330,47 @@ class StartOutcome:
     status_code: int | None = None
 
 
+# Bounds for the names a refused start reports. The body itself is never kept:
+# a governed start carries the run's script archive, and a target's 4xx body
+# can echo the request.
+START_FAILURE_NAMES: Final[int] = 5
+START_FAILURE_CHARS: Final[int] = 300
+
+
+def _start_failure_summary(response: httpx.Response) -> str:
+    """The field names and error types a target refused, never its body.
+
+    422 bodies carry one ``detail`` entry per rejected field, each with a
+    ``loc`` and a ``type``. Only those are quoted, bounded, so an upload or a
+    secret echoed in ``input`` or ``msg`` cannot reach the run's status.
+    """
+    try:
+        detail = (response.json() or {}).get("detail")
+    except ValueError:
+        detail = None
+    names: list[str] = []
+    if isinstance(detail, list):
+        for item in detail:
+            if not isinstance(item, dict):
+                continue
+            loc = item.get("loc")
+            kind = item.get("type")
+            name = (
+                ".".join(str(part) for part in loc)
+                if isinstance(loc, list) and loc
+                else ""
+            )
+            if isinstance(kind, str):
+                name = f"{name} ({kind})" if name else kind
+            if name:
+                names.append(name)
+            if len(names) >= START_FAILURE_NAMES:
+                break
+    summary = "; ".join(names)[:START_FAILURE_CHARS]
+    status = f"HTTP {response.status_code}"
+    return f"{status}: {summary}" if summary else status
+
+
 @dataclass(frozen=True)
 class ConversationState:
     """What one conversation-record read says about the run."""
@@ -572,10 +613,10 @@ class GovernedConversationBackend(ExecutionBackend):
         a repeat start with the same ``conversation_id`` answers 200 and does
         not resend the task. 201 and 200 are both a confirmed start.
 
-        ``prepared`` carries the secrets, repositories and capability verdicts
-        resolved before the claim. ``start`` carries the run's plugins, or the
-        script bundle the sandbox unpacks; ``prepare_start`` already refused a
-        target that does not advertise what the start carries.
+        ``prepared`` carries the secrets and repositories resolved before the
+        claim; ``prepare_start`` already refused a target that does not
+        advertise what the start carries. ``start`` carries the run's plugins,
+        or the script bundle the sandbox unpacks.
         """
         target = self._require_target()
         preset = automation.preset_metadata or {}
@@ -600,8 +641,8 @@ class GovernedConversationBackend(ExecutionBackend):
             payload["bundle"] = start.bundle.to_payload()
         if target.agent_profile_id:
             payload["agent_profile_id"] = target.agent_profile_id
-        # Only where the run already carries them: a plain prompt preset has
-        # neither, and governed runs never get the finish-tool plugin.
+        # A prompt preset carries no iteration budget; only a preset that does
+        # sends it.
         if preset.get("max_iterations") is not None:
             payload["max_iterations"] = preset["max_iterations"]
 
@@ -641,10 +682,7 @@ class GovernedConversationBackend(ExecutionBackend):
                 status_code=response.status_code,
             )
         return StartOutcome(
-            error=(
-                "Conversation start failed "
-                f"(HTTP {response.status_code}): {response.text[:500]}"
-            ),
+            error=f"Conversation start failed ({_start_failure_summary(response)})",
             code="conversation_error",
             status_code=response.status_code,
         )

@@ -1725,8 +1725,9 @@ async def dispatch_automation(
     await _assert_can_manage(auto, user)
     await _assert_normal_api_can_use_draft_artifact(session, auto)
 
-    # A run on a removed target can never dispatch; refuse here rather than
-    # letting the run fail in the background.
+    # A run on a removed target, or of a kind the target no longer allows, can
+    # never dispatch; refuse here rather than letting the run fail in the
+    # background.
     validate_target_selection(
         auto.target_id,
         kind=classify_automation(

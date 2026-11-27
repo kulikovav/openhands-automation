@@ -1812,7 +1812,10 @@ async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any
     A/B experiment deliberately stores none, and the caller refuses that run.
     A plugin-spec automation stores the executable plugin, its validated
     config, and either the pinned required plugins or the refs its manifest
-    names, resolved and pinned exactly as a stock run resolves them.
+    names. Those refs are resolved and pinned the way a stock run resolves
+    them, with two differences: a local source is refused, and no secrets are
+    passed, so a private source's placeholders are not expanded. The config
+    rides the start; no governed plugin loader reads it yet.
     """
     spec = automation.plugin_spec
     if spec is None:

@@ -16,7 +16,10 @@ Scheduled and event-driven automation execution for OpenHands Cloud. This servic
   exactly the keys `id`, `name`, `url`, `api_key`, `origin` (defaults to the URL
   origin), `capability`, `policy_id`, `agent_profile_id` and `kinds` (defaults to
   `["prompt"]`); unknown keys fail startup. Unset or empty means no targets and
-  legacy behavior.
+  legacy behavior. A plugin start carries the automation's stored `config`: a
+  conversation runner's rendered arguments already include its values, while a
+  script runner's `config.json` is not yet written where the plugin reads it on
+  the governed path.
 
 For a direct callback example, see [Teams outgoing webhooks](docs/teams-webhooks.md),
 including source admission, API setup and acknowledgement behavior.

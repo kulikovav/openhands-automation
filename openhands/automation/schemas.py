@@ -1769,7 +1769,7 @@ class TriggerCapabilities(_SetupContractModel):
 
 
 class TargetCapability(_SetupContractModel):
-    """One configured execution target, with no secret and no URL."""
+    """One configured execution target, with no secret and no URL beyond the origin."""
 
     id: str = Field(..., description="AUTOMATION_TARGETS entry id")
     name: str = Field(..., description="Display name of the target")
