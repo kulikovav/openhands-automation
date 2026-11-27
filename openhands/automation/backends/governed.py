@@ -24,9 +24,9 @@ import logging
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Protocol
 from urllib.parse import quote
 
 import httpx
@@ -34,23 +34,44 @@ from sqlalchemy import inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openhands.automation.backends.base import (
+    AutomationBundle,
     ConversationStart,
     ExecutionBackend,
     ExecutionContext,
 )
+from openhands.automation.config import get_config
+from openhands.automation.exceptions import TarballNotFoundError
 from openhands.automation.models import Automation, AutomationRun, AutomationRunStatus
-from openhands.automation.plugin_specs import PluginSpecError
-from openhands.automation.targets import AutomationTarget, resolve_target
+from openhands.automation.plugin_specs import (
+    PluginSpecError,
+    plugin_start_sources,
+    resolve_plugin_spec,
+)
+from openhands.automation.preset_router import with_current_preset_runner
+from openhands.automation.targets import (
+    BUNDLE_KINDS,
+    CODE_TARGET_KIND_UNSUPPORTED,
+    CODE_TARGET_UNAVAILABLE,
+    AutomationKind,
+    AutomationTarget,
+    classify_automation,
+    plugin_preset_sources,
+    resolve_target,
+    target_kind_error,
+)
 from openhands.automation.utils.agent_server import (
     VerificationOutcome,
     VerificationResult,
 )
+from openhands.automation.utils.run import update_run_timeout_at
 from openhands.automation.utils.run_status_detail import (
     RunStatusDetailKind,
     RunStatusPhase,
     make_run_status_detail,
 )
+from openhands.automation.utils.tarball_validation import parse_internal_upload_id
 from openhands.automation.utils.time import ensure_utc, utcnow
+from openhands.sdk.plugin import PluginSourceError
 from openhands.workspace import RepoSource
 
 
@@ -972,4 +993,342 @@ async def cancel_governed_conversation(
         )
     return await release_conversation(
         client, backend, claim, retain_transcript=retain_transcript
+    )
+
+
+async def _governed_plugin_sources(automation: Automation) -> list[dict[str, Any]]:
+    """The plugin sources and config a governed conversation loads.
+
+    A plugin preset stores its sources in ``preset_metadata['plugins']``; an
+    A/B experiment deliberately stores none, and the caller refuses that run.
+    A plugin-spec automation stores the executable plugin, its validated
+    config, and either the pinned required plugins or the refs its manifest
+    names. Those refs are resolved and pinned the way a stock run resolves
+    them, with two differences: a local source is refused, and no secrets are
+    passed, so a private source's placeholders are not expanded. The config
+    rides the start; no governed plugin loader reads it yet.
+    """
+    spec = automation.plugin_spec
+    if spec is None:
+        return plugin_start_sources(
+            None, None, plugin_preset_sources(automation.preset_metadata)
+        )
+    stored_required = spec.get("required_plugins")
+    if stored_required is None:
+        try:
+            source, _manifest, resolved_ref, required = await resolve_plugin_spec(
+                spec, allow_local_sources=False
+            )
+        except (PluginSpecError, PluginSourceError) as exc:
+            raise PluginSpecError(
+                f"Could not resolve the plugin's run-time plugins: {exc}"
+            ) from exc
+        plugins = plugin_start_sources(source, resolved_ref, required)
+    else:
+        plugins = plugin_start_sources(None, None, [spec["plugin"], *stored_required])
+    config = spec.get("config") or {}
+    if config:
+        plugins[0] = {**plugins[0], "config": config}
+    return plugins
+
+
+def _governed_bundle_config(automation: Automation) -> dict[str, Any]:
+    """The config a bundle was created with, or an empty one.
+
+    It is the template config the automation was created with: the
+    client-supplied setup-form values, stored verbatim in the ``template``
+    provenance.
+    """
+    template = (automation.preset_metadata or {}).get("template")
+    config = template.get("config") if isinstance(template, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+class FailDispatch(Protocol):
+    """Mark a run failed, optionally disabling its automation."""
+
+    async def __call__(
+        self,
+        error: str,
+        *,
+        disable: bool = False,
+        status_detail: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None: ...
+
+
+class RunLogContext(Protocol):
+    """The structured log fields for one dispatched run."""
+
+    def __call__(self, sandbox_id: str | None = None) -> dict[str, Any]: ...
+
+
+async def _fail_dispatch(
+    fail: FailDispatch,
+    error: str,
+    *,
+    phase: RunStatusPhase,
+    detail_kind: RunStatusDetailKind,
+    source: str,
+    operation: str,
+    code: str | None = None,
+    disable: bool = False,
+) -> None:
+    """Fail a dispatched run with one non-transient status detail."""
+    await fail(
+        error,
+        disable=disable,
+        status_detail=make_run_status_detail(
+            phase=phase,
+            kind=detail_kind,
+            detail=error,
+            transient=False,
+            source=source,
+            operation=operation,
+            code=code,
+        ),
+    )
+
+
+async def _governed_conversation_start(
+    automation: Automation,
+    kind: AutomationKind,
+    session_factory: async_sessionmaker[AsyncSession],
+    fail: FailDispatch,
+    log_ctx: RunLogContext,
+) -> ConversationStart | None:
+    """The start contract for a governed run, or None once the run failed.
+
+    A script or custom-tarball run carries one bundle, read from the upload
+    store and never extracted here. A plugin run carries its sources and
+    config. A plugin A/B experiment is refused: only the stock runner can pick
+    a variant. ``kind`` is classified once by the caller, which also checks it
+    against the target's allowed kinds.
+    """
+    start = ConversationStart()
+    if kind == "plugin":
+        try:
+            start.plugins = await _governed_plugin_sources(automation)
+        except PluginSpecError as exc:
+            await _fail_dispatch(
+                fail,
+                str(exc),
+                phase=RunStatusPhase.DISPATCH,
+                detail_kind=RunStatusDetailKind.UNKNOWN,
+                source="automation_service",
+                operation="prepare_plugins",
+                code="plugin_spec_unresolved",
+            )
+            return None
+        if not start.plugins:
+            await _fail_dispatch(
+                fail,
+                (
+                    "A/B plugin variants run only on the stock runner; a "
+                    "governed target cannot pick a variant"
+                ),
+                phase=RunStatusPhase.DISPATCH,
+                detail_kind=RunStatusDetailKind.UNKNOWN,
+                source="automation_service",
+                operation="prepare_plugins",
+                code="plugin_variants_unsupported",
+            )
+            return None
+        return start
+    if kind not in BUNDLE_KINDS:
+        return start
+
+    upload_id = parse_internal_upload_id(automation.tarball_path)
+    if upload_id is None:
+        await _fail_dispatch(
+            fail,
+            (
+                "A governed target runs a script from a stored upload; this "
+                "automation's tarball is a URL the target cannot fetch"
+            ),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="automation_service",
+            operation="prepare_bundle",
+            code="bundle_source_unsupported",
+        )
+        return None
+    try:
+        async with session_factory() as session:
+            # Imported here: the dispatcher imports this module, and the
+            # download helper stays beside the stock path that shares it.
+            from openhands.automation.dispatcher import _download_internal_tarball
+
+            stored_tarball = await _download_internal_tarball(
+                upload_id, automation.org_id, session
+            )
+    except TarballNotFoundError as exc:
+        # The upload is gone for good; the same condition disables an
+        # automation on the default backend.
+        await _fail_dispatch(
+            fail,
+            str(exc),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+            source="automation_service",
+            operation="prepare_bundle",
+            code=type(exc).__name__,
+            disable=True,
+        )
+        return None
+    start.bundle = AutomationBundle(
+        entrypoint=automation.entrypoint,
+        setup_script_path=automation.setup_script_path,
+        config=_governed_bundle_config(automation),
+        tarball=with_current_preset_runner(stored_tarball),
+    )
+    logger.info(
+        "Governed bundle prepared (%d bytes)",
+        len(start.bundle.tarball),
+        extra=log_ctx(),
+    )
+    return start
+
+
+async def _execute_governed_run(
+    run: AutomationRun,
+    automation: Automation,
+    backend: ExecutionBackend,
+    session_factory: async_sessionmaker[AsyncSession],
+    client: httpx.AsyncClient,
+    effective_timeout: int,
+    fail: FailDispatch,
+    log_ctx: RunLogContext,
+) -> None:
+    """Dispatch a governed run as one conversation on its execution target.
+
+    The target's kind gate, the bundle or plugin sources, and the read-only
+    capability probes are all resolved before the claim, so a bad
+    configuration fails the run without leaving a claimed conversation. The
+    execution claim is committed before the start call, so a crash or restart
+    reuses the same conversation id and the target's idempotent create dedupes
+    a repeat start. A run with a claim is never requeued. The watchdog's
+    ``reconcile_governed_runs`` owns everything after the start.
+    """
+    target = resolve_target(run.target_id)
+    if target is None:
+        await _fail_dispatch(
+            fail,
+            f"Execution target {run.target_id!r} is no longer configured",
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.ENVIRONMENT_UNAVAILABLE,
+            source="automation_service",
+            operation="resolve_target",
+            code=CODE_TARGET_UNAVAILABLE,
+        )
+        return
+
+    if run.conversation_id == governed_conversation_id_for(run.id):
+        # A confirmed start already happened; a duplicate dispatch must not
+        # prepare or resend anything.
+        logger.info(
+            "Governed conversation %s already started",
+            run.conversation_id,
+            extra=log_ctx(),
+        )
+        return
+
+    kind = classify_automation(
+        preset_metadata=automation.preset_metadata,
+        plugin_spec=automation.plugin_spec,
+        tarball_path=automation.tarball_path,
+        entrypoint=automation.entrypoint,
+    )
+    refusal = target_kind_error(target, kind)
+    if refusal is not None:
+        # A target can shrink its ``kinds`` after an automation is stored.
+        # Every run, triggered or manual, is refused by the same rule.
+        await _fail_dispatch(
+            fail,
+            refusal,
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="automation_service",
+            operation="validate_target",
+            code=CODE_TARGET_KIND_UNSUPPORTED,
+        )
+        return
+
+    start = await _governed_conversation_start(
+        automation, kind, session_factory, fail, log_ctx
+    )
+    if start is None:
+        return
+
+    try:
+        prepared = await backend.prepare_start(client, automation, start)
+    except TargetCapabilityError as exc:
+        # The probes are read-only and run before the claim, so a config
+        # mismatch leaves no claimed conversation.
+        await _fail_dispatch(
+            fail,
+            str(exc),
+            phase=RunStatusPhase.DISPATCH,
+            detail_kind=RunStatusDetailKind.UNKNOWN,
+            source="agent_server",
+            operation="preflight_start",
+            code=exc.code,
+        )
+        return
+
+    claim = await claim_execution(session_factory, run, target)
+    if claim is None:
+        logger.info(
+            "Run left RUNNING before its claim; nothing to start", extra=log_ctx()
+        )
+        return
+
+    outcome = await backend.start_conversation(
+        client, automation, run, claim, start, prepared
+    )
+    if outcome.confirmed:
+        # The response named the exact claimed UUID: only now is it recorded.
+        await record_started_conversation(session_factory, run, claim.conversation_id)
+        await update_run_timeout_at(
+            session_factory,
+            run.id,
+            utcnow()
+            + timedelta(
+                seconds=effective_timeout + get_config().sandbox.run_timeout_margin
+            ),
+        )
+        logger.info(
+            "Governed conversation %s started on target %s",
+            claim.conversation_id,
+            target.id,
+            extra=log_ctx(),
+        )
+        return
+    if outcome.ambiguous:
+        # The start may have reached the target. The claim stands and the
+        # watchdog reconciles by identity; nothing starts a second
+        # conversation.
+        logger.warning(
+            "Ambiguous governed start acknowledgement (%s); leaving claim %s",
+            outcome.error,
+            claim.conversation_id,
+            extra=log_ctx(),
+        )
+        return
+    await fail(
+        outcome.error or "Failed to start the governed conversation",
+        status_detail=make_run_status_detail(
+            phase=RunStatusPhase.DISPATCH,
+            kind=(
+                RunStatusDetailKind.AUTH
+                if outcome.code == "policy_denied"
+                else RunStatusDetailKind.EXECUTION_ERROR
+            ),
+            detail=outcome.error or "Failed to start the governed conversation",
+            transient=False,
+            source="agent_server",
+            operation="start_conversation",
+            code=outcome.code or "conversation_error",
+            status_code=outcome.status_code,
+        ),
     )

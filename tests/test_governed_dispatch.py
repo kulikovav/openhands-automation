@@ -919,7 +919,7 @@ class TestGovernedPlugins:
             )
 
         monkeypatch.setattr(
-            "openhands.automation.dispatcher.resolve_plugin_spec", fake_resolve
+            "openhands.automation.backends.governed.resolve_plugin_spec", fake_resolve
         )
 
         async with server.client() as client:
@@ -946,7 +946,7 @@ class TestGovernedPlugins:
             raise PluginSpecError("manifest unreachable")
 
         monkeypatch.setattr(
-            "openhands.automation.dispatcher.resolve_plugin_spec", fail_resolve
+            "openhands.automation.backends.governed.resolve_plugin_spec", fail_resolve
         )
 
         async with server.client() as client:
